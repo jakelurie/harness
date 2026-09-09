@@ -1,0 +1,52 @@
+{
+  "default": "opus",
+  "models": {
+    "opus": {
+      "provider": "claude-cli",
+      "model": "opus",
+      "label": "Claude Opus (subscription)",
+      "effort": "high",
+      "contextTokens": 1000000,
+      "_comment": "Runs the local `claude` CLI, which already holds your login. No API key needed."
+    },
+    "sonnet": {
+      "provider": "claude-cli",
+      "model": "sonnet",
+      "label": "Claude Sonnet (subscription)"
+    },
+
+    "astra": {
+      "provider": "openai-responses",
+      "model": "gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "reasoningEffort": "medium",
+      "priceIn": 10,
+      "priceOut": 50,
+      "maxTokens": 128000,
+      "contextTokens": 1050000,
+      "softLimitTokens": 272000,
+      "_comment": "Responses API: this model will not do function tools on /v1/chat/completions. softLimitTokens keeps requests under the band where the whole request reprices."
+    },
+
+    "gpt": {
+      "provider": "openai",
+      "model": "gpt-5",
+      "label": "GPT-5",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "priceIn": 2,
+      "priceOut": 10
+    },
+
+    "local": {
+      "provider": "openai",
+      "model": "qwen2.5-coder:7b-instruct-q4_K_M",
+      "label": "Qwen2.5 Coder 7B (local)",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "maxTokens": 4096,
+      "parseTextToolCalls": true,
+      "_comment": "Ollama. Small quantised models often emit tool calls as text; the fallback recovers them."
+    }
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+*.log
+
+# Nothing here holds secrets today — real config and keys live in the OS
+# application-support directory, not the repo — but these are the shapes that
+# would carry them if the layout ever changed.
+secrets.json
+server-token
+models.json
+.env

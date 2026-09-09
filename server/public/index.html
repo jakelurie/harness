@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+    <meta name="theme-color" content="#14161a" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Harness</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header id="bar">
+      <button id="menu" class="tap" aria-label="Sessions">☰</button>
+      <div id="title">
+        <div id="title-name">harness</div>
+        <div id="title-sub">pick a session</div>
+      </div>
+      <button id="jobs" class="tap" aria-label="Background jobs">⚙️</button>
+      <button id="usage" class="tap" aria-label="Usage">📊</button>
+      <button id="files" class="tap" aria-label="Files">📁</button>
+      <button id="screen" class="tap" aria-label="Laptop screen">🖥</button>
+      <button id="gear" class="tap" aria-label="Settings">🔧</button>
+    </header>
+
+    <nav id="tabs">
+      <button class="tab on" data-tab="chat">chat</button>
+      <button class="tab" data-tab="monitor">monitoring</button>
+    </nav>
+
+    <div id="banner" hidden></div>
+
+    <div id="working" hidden>
+      <span class="pulse"></span>
+      <span>working</span>
+      <span id="working-what" class="what"></span>
+      <span id="working-time" class="mono"></span>
+    </div>
+
+    <section id="panel" hidden>
+      <div id="panel-body"></div>
+    </section>
+
+    <main id="transcript">
+      <div class="empty">
+        <p>no session open</p>
+        <p class="dim">tap ☰ to start one</p>
+      </div>
+    </main>
+
+    <footer id="composer">
+      <textarea id="input" rows="1" placeholder="Describe what you want built…" enterkeyhint="send"></textarea>
+      <button id="send" class="primary">send</button>
+      <button id="stop" class="danger" hidden>stop</button>
+    </footer>
+
+    <div id="sheet-back" hidden><section id="sheet"></section></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
