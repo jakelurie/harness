@@ -26,7 +26,9 @@ export async function complete({
   // over that line expensive, so the transcript is held under it by default.
   // `longContext` lifts that guard deliberately, for work worth the higher rate:
   // the ceiling becomes the model's real context window instead.
-  const cap = longContext ? spec.contextTokens : (spec.softLimitTokens ?? spec.contextTokens);
+  // The band guard is about price, not capability, so it applies only when a
+  // session has explicitly asked to stay under it.
+  const cap = spec.softLimitTokens && !longContext ? spec.softLimitTokens : spec.contextTokens;
   const messages = cap
     ? budgetOpenAI(toOpenAI(events, system), Math.floor(cap * 0.85 * 3.5))
     : toOpenAI(events, system);
@@ -96,6 +98,7 @@ export async function complete({
         reply.usage.input = chunk.usage.prompt_tokens ?? 0;
         reply.usage.output = chunk.usage.completion_tokens ?? 0;
         reply.usage.cached = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+        reply.usage.cacheWrite = chunk.usage.prompt_tokens_details?.cache_write_tokens ?? 0;
       }
       const choice = chunk.choices?.[0];
       if (!choice) continue;

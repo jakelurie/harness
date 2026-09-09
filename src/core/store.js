@@ -58,13 +58,38 @@ export function newSession({ name, model, projectDir, system = '', mode = 'agent
   };
 }
 
+// One in-flight write per session. Steps from an agent backend arrive faster
+// than a write completes, and two saves racing on a shared temp filename meant
+// the second rename found nothing there — which crashed the server mid-turn.
+const writing = new Map();
+let writeSeq = 0;
+
 export async function save(session) {
-  session.updatedAt = Date.now();
-  const file = fileFor(session.id);
-  const tmp = `${file}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, file); // atomic: never a half-written transcript
-  return session;
+  const prior = writing.get(session.id) ?? Promise.resolve();
+
+  const run = prior
+    .catch(() => {})                       // one failed write must not poison the queue
+    .then(async () => {
+      session.updatedAt = Date.now();
+      const file = fileFor(session.id);
+      // Unique per write, so concurrent saves cannot collide on the same path.
+      const tmp = `${file}.${process.pid}.${(writeSeq += 1)}.tmp`;
+      try {
+        await fs.writeFile(tmp, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
+        await fs.rename(tmp, file);        // atomic: never a half-written transcript
+      } catch (e) {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+        throw e;
+      }
+      return session;
+    });
+
+  writing.set(session.id, run);
+  try {
+    return await run;
+  } finally {
+    if (writing.get(session.id) === run) writing.delete(session.id);
+  }
 }
 
 /**

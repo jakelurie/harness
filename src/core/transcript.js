@@ -24,8 +24,11 @@ export function newId(prefix = 'e') {
   return `${prefix}_${Date.now().toString(36)}_${counter.toString(36)}`;
 }
 
-export function userEvent(text) {
-  return { id: newId('u'), ts: Date.now(), type: 'user', text };
+export function userEvent(text, attachments = []) {
+  return {
+    id: newId('u'), ts: Date.now(), type: 'user', text,
+    ...(attachments.length ? { attachments } : {}),
+  };
 }
 
 export function assistantEvent(reply) {
@@ -63,7 +66,9 @@ export function assistantEvent(reply) {
  * alternative would be discarding what was asked for, which is the one thing
  * that cannot be recovered.
  */
-export const MAX_TOOL_OUTPUT = 24_000;
+// Generous on purpose: truncating a tool result costs the model information,
+// and information is worth more than tokens here.
+export const MAX_TOOL_OUTPUT = 200_000;
 
 const IMAGE_BLOCK = /\{"type":"image","source":\{[^{}]*"data":"[A-Za-z0-9+/=\s]{200,}"[^{}]*\}[^{}]*\}/g;
 const LONE_BASE64 = /[A-Za-z0-9+/]{1500,}={0,2}/g;
@@ -103,7 +108,9 @@ export function noteEvent(text) {
 
 /** Events the models actually see. Notes are bookkeeping for the UI. */
 function sendable(events) {
-  return events.filter((e) => e.type !== 'note');
+  // Notes and file listings are bookkeeping for the UI; the model already knows
+  // what it wrote, and re-sending the list every turn would only cost context.
+  return events.filter((e) => e.type !== 'note' && e.type !== 'files');
 }
 
 /**
@@ -145,8 +152,18 @@ export function toAnthropic(events) {
     flush();
 
     if (e.type === 'user') {
-      if (!e.text) continue;
-      messages.push({ role: 'user', content: [{ type: 'text', text: e.text }] });
+      const imgs = (e.attachments ?? []).filter((a) => a.dataUrl);
+      if (!e.text && !imgs.length) continue;
+      messages.push({
+        role: 'user',
+        content: [
+          ...imgs.map((a) => ({
+            type: 'image',
+            source: { type: 'base64', media_type: a.mime, data: a.dataUrl.split(',')[1] },
+          })),
+          ...(e.text ? [{ type: 'text', text: e.text }] : []),
+        ],
+      });
     } else if (e.type === 'assistant') {
       const content = [];
       if (e.text) content.push({ type: 'text', text: e.text });
@@ -170,13 +187,25 @@ export function toAnthropic(events) {
 
 // ------------------------------------------------------------------ OpenAI
 
+/** A user message with images becomes a content array rather than a string. */
+function openAIUserContent(e, images) {
+  if (!images?.length) return e.text;
+  return [
+    ...(e.text ? [{ type: 'text', text: e.text }] : []),
+    ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+  ];
+}
+
 export function toOpenAI(events, system) {
   const messages = [];
   if (system) messages.push({ role: 'system', content: system });
 
   for (const e of sendable(events)) {
     if (e.type === 'user') {
-      if (e.text) messages.push({ role: 'user', content: e.text });
+      const imgs = (e.attachments ?? []).filter((a) => a.dataUrl).map((a) => a.dataUrl);
+      if (e.text || imgs.length) {
+        messages.push({ role: 'user', content: openAIUserContent(e, imgs) });
+      }
     } else if (e.type === 'assistant') {
       const msg = { role: 'assistant', content: e.text || null };
       if (e.toolCalls?.length) {
@@ -254,7 +283,10 @@ export function renderForPrompt(events, { budgetChars = Infinity, keepRecent = 1
   const blocks = [];
   for (const e of sendable(events)) {
     if (e.type === 'user') {
-      blocks.push({ kind: 'user', text: `## User\n${e.text}` });
+      // The CLI has its own file tools, so a path is more useful (and far
+      // cheaper) than inlining the image.
+      const files = (e.attachments ?? []).map((a) => `[attached image: ${a.path}]`).join('\n');
+      blocks.push({ kind: 'user', text: `## User\n${[e.text, files].filter(Boolean).join('\n')}` });
     } else if (e.type === 'assistant') {
       const bits = [];
       if (e.text) bits.push(e.text);
@@ -383,7 +415,16 @@ export function toResponses(events) {
   const input = [];
   for (const e of sendable(events)) {
     if (e.type === 'user') {
-      input.push({ role: 'user', content: e.text });
+      const imgs = (e.attachments ?? []).filter((a) => a.dataUrl);
+      input.push(imgs.length
+        ? {
+          role: 'user',
+          content: [
+            ...(e.text ? [{ type: 'input_text', text: e.text }] : []),
+            ...imgs.map((a) => ({ type: 'input_image', image_url: a.dataUrl })),
+          ],
+        }
+        : { role: 'user', content: e.text });
     } else if (e.type === 'assistant') {
       if (e.text) input.push({ role: 'assistant', content: e.text });
       for (const [i, c] of (e.toolCalls ?? []).entries()) {

@@ -124,8 +124,10 @@ const lastAssistant = [...sessionU.events].reverse().find((e) => e.type === 'ass
 check('the turn total lands on the last message, not the per-chunk fragment',
   lastAssistant.usage.cached === 100 && lastAssistant.usage.output === 4,
   JSON.stringify(lastAssistant.usage));
-check('and the fragment figures are replaced, not added to',
-  lastAssistant.usage.input === 9, JSON.stringify(lastAssistant.usage));
+// `input` is the total read: 9 uncached + 100 served from cache.
+check('input is the total read, with cached a subset of it',
+  lastAssistant.usage.input === 109 && lastAssistant.usage.cached === 100,
+  JSON.stringify(lastAssistant.usage));
 
 // A failing CLI must surface as a note, not a silent stall.
 const badBin = path.join(path.dirname(bin), 'claude-bad');

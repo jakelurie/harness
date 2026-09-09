@@ -73,11 +73,11 @@ export async function complete({
 
   // The whole transcript goes in as one prompt. Re-sending it each turn is what
   // lets a session move between providers with its history intact.
-  // Leave room for what the harness does not control: Claude Code's own system
-  // prompt, its tool definitions, and the reply itself. Roughly 3.5 characters
-  // per token, and only a share of the window is ours to fill.
+  // Trim only to avoid exceeding the context window — never to save tokens.
+  // Room is still left for what the harness does not control: Claude Code's own
+  // system prompt, its tool definitions, and the reply itself.
   const contextTokens = spec.contextTokens ?? 1_000_000;
-  const share = spec.contextShare ?? 0.45;
+  const share = spec.contextShare ?? 0.75;
   child.stdin.end(renderForPrompt(events, { budgetChars: Math.floor(contextTokens * share * 3.5) }));
 
   const names = new Map(); // tool_use id -> name, to label the results
@@ -149,7 +149,14 @@ export async function complete({
     if (d.type === 'result') {
       reply.stopReason = d.stop_reason ?? d.subtype ?? null;
       const u = d.usage ?? {};
-      reply.usage.input = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      // `input` is the TOTAL read, with `cached` a subset of it — the same
+      // convention the OpenAI providers use. Anthropic reports the three parts
+      // separately, so they are summed here rather than left inconsistent,
+      // which otherwise produced a "cached share" over 8000%.
+      reply.usage.input = (u.input_tokens ?? 0)
+        + (u.cache_creation_input_tokens ?? 0)
+        + (u.cache_read_input_tokens ?? 0);
+      reply.usage.cacheWrite = u.cache_creation_input_tokens ?? 0;
       reply.usage.output = u.output_tokens ?? 0;
       reply.usage.cached = u.cache_read_input_tokens ?? 0;
       reply.cost = d.total_cost_usd ?? null;

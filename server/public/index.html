@@ -16,7 +16,6 @@
         <div id="title-name">harness</div>
         <div id="title-sub">pick a session</div>
       </div>
-      <button id="jobs" class="tap" aria-label="Background jobs">⚙️</button>
       <button id="usage" class="tap" aria-label="Usage">📊</button>
       <button id="files" class="tap" aria-label="Files">📁</button>
       <button id="screen" class="tap" aria-label="Laptop screen">🖥</button>
@@ -29,6 +28,8 @@
     </nav>
 
     <div id="banner" hidden></div>
+
+    <button id="background" hidden></button>
 
     <div id="working" hidden>
       <span class="pulse"></span>
@@ -48,8 +49,14 @@
       </div>
     </main>
 
+    <div id="pending" hidden></div>
+
+    <button id="mon-chat-toggle" hidden></button>
+
     <footer id="composer">
       <textarea id="input" rows="1" placeholder="Describe what you want built…" enterkeyhint="send"></textarea>
+      <input id="pick" type="file" accept="image/*" multiple hidden />
+      <button id="attach" class="ghost attach-btn" aria-label="Attach a photo">＋</button>
       <button id="send" class="primary">send</button>
       <button id="stop" class="danger" hidden>stop</button>
     </footer>

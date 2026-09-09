@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import * as U from '../src/core/usage-store.js';
+import { costOf } from '../src/core/usage-store.js';
 
 const fail = [];
 const check = (label, cond, extra = '') => {
@@ -93,6 +94,58 @@ check('the ledger survives a restart',
 check('a missing ledger loads as empty, not an error',
   (await U.load(path.join(dir, 'nowhere'))).buckets && Object.keys((await U.load(path.join(dir, 'nowhere'))).buckets).length === 0);
 await fs.rm(dir, { recursive: true, force: true });
+
+// ---- cost, which is easy to get badly wrong ----
+{
+  const astra = {
+    priceIn: 10, priceCached: 1, priceCacheWrite: 12.5, priceOut: 50,
+    longContextPricing: { threshold: 272_000, priceIn: 20, priceCached: 2, priceCacheWrite: 25, priceOut: 75 },
+  };
+
+  // `input` is the total and `cached` a subset of it — charging full rate for
+  // the cached part is the bug this replaced.
+  // Kept under the band so this checks the cache rate, not the band rate.
+  const c1 = costOf({ input: 200_000, cached: 180_000, output: 10_000 }, astra);
+  const expected = (20_000 * 10 + 180_000 * 1 + 10_000 * 50) / 1e6;
+  check('cached input bills at the cached rate', Math.abs(c1 - expected) < 1e-9, `$${c1.toFixed(4)}`);
+  check('and is far cheaper than charging it all at full rate',
+    c1 < (200_000 * 10 + 10_000 * 50) / 1e6 / 2, `$${c1.toFixed(2)} vs $${((200_000 * 10 + 10_000 * 50) / 1e6).toFixed(2)}`);
+
+  const c2 = costOf({ input: 300_000, cached: 0, output: 1_000 }, astra);
+  check('crossing the band reprices the whole request',
+    Math.abs(c2 - (300_000 * 20 + 1_000 * 75) / 1e6) < 1e-9, `$${c2.toFixed(4)}`);
+
+  const c3 = costOf({ input: 271_000, cached: 0, output: 1_000 }, astra);
+  check('just under the band stays at standard rates',
+    Math.abs(c3 - (271_000 * 10 + 1_000 * 50) / 1e6) < 1e-9, `$${c3.toFixed(4)}`);
+  check('the band is a cliff, not a slope', c2 > c3 * 1.9, `${c3.toFixed(2)} -> ${c2.toFixed(2)}`);
+
+  check('cache writes bill at their own rate',
+    Math.abs(costOf({ input: 1000, cached: 0, cacheWrite: 1000, output: 0 }, astra)
+      - (1000 * 10 + 1000 * 12.5) / 1e6) < 1e-9);
+
+  check('a subscription model costs nothing per token',
+    costOf({ input: 1e6, cached: 5e5, output: 1e4 }, { label: 'opus' }) === 0);
+  check('cached is clamped to input, so bad data cannot make it negative',
+    costOf({ input: 100, cached: 999_999, output: 0 }, astra) >= 0);
+}
+
+// ---- history recorded under the older convention still reads correctly ----
+{
+  // Back then `input` excluded the cached part, so cached could exceed it.
+  const legacy = { input: 1_000, cached: 50_000, output: 100 };
+  const c = costOf(legacy, { priceIn: 10, priceCached: 1, priceOut: 50 });
+  const expected = (1_000 * 10 + 50_000 * 1 + 100 * 50) / 1e6;
+  check('legacy usage is normalised rather than mispriced',
+    Math.abs(c - expected) < 1e-9, `$${c.toFixed(4)}`);
+
+  let st2 = { version: 1, buckets: {}, cursors: {}, limits: {}, periods: [], updatedAt: 0 };
+  U.ingestSession(st2, { id: 'L', events: [{ type: 'assistant', model: 'm', ts: now, usage: legacy }] },
+    { m: { label: 'm' } });
+  const row = U.query(st2, { from: 0, to: now + 1000, models: { m: {} } })[0];
+  check('and its cached share cannot exceed 100%', row.cached <= row.input,
+    `${row.cached} of ${row.input}`);
+}
 
 console.log(`\n${fail.length ? `${fail.length} FAILED` : 'all green'}`);
 process.exit(fail.length ? 1 : 0);

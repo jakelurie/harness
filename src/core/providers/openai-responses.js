@@ -26,7 +26,9 @@ export function makeClient(spec) {
 export async function complete({
   client, spec, events, system, onText, onThinking, useTools = true, longContext = false, signal,
 }) {
-  const cap = longContext ? spec.contextTokens : (spec.softLimitTokens ?? spec.contextTokens);
+  // The band guard is about price, not capability, so it applies only when a
+  // session has explicitly asked to stay under it.
+  const cap = spec.softLimitTokens && !longContext ? spec.softLimitTokens : spec.contextTokens;
   const items = toResponses(events);
   const input = cap ? budgetOpenAI(items, Math.floor(cap * 0.85 * 3.5)) : items;
 
@@ -104,6 +106,7 @@ export async function complete({
           reply.usage.input = u.input_tokens ?? 0;
           reply.usage.output = u.output_tokens ?? 0;
           reply.usage.cached = u.input_tokens_details?.cached_tokens ?? 0;
+          reply.usage.cacheWrite = u.input_tokens_details?.cache_write_tokens ?? 0;
           reply.stopReason = event.response?.status ?? null;
           if (event.type === 'response.failed') {
             reply.error = event.response?.error?.message ?? 'the response failed';

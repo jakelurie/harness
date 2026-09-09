@@ -8,12 +8,14 @@
 
 import * as anthropic from './anthropic.js';
 import * as claudeCli from './claude-cli.js';
+import * as codexCli from './codex-cli.js';
 import * as openaiResponses from './openai-responses.js';
 import * as openai from './openai.js';
 
 const REGISTRY = {
   [anthropic.kind]: anthropic,
   [claudeCli.kind]: claudeCli,
+  [codexCli.kind]: codexCli,
   [openai.kind]: openai,
   [openaiResponses.kind]: openaiResponses,
 };

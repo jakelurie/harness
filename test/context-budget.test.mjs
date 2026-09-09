@@ -123,5 +123,28 @@ check('no budget means no trimming', budgetOpenAI(msgs, Infinity).length === msg
   srv.close();
 }
 
+// ---- a backend with a hard input-size limit ----
+// Codex refuses stdin over 1,048,576 characters. A budget derived from the
+// context window overshot that and the turn was rejected outright, so the
+// character ceiling has to win over any token-derived figure.
+{
+  const CODEX_MAX = 1_048_576;
+  const huge = [userEvent('go')];
+  for (let i = 0; i < 400; i += 1) {
+    huge.push(assistantEvent({ model: 'x', text: `step ${i}`, toolCalls: [{ id: `c${i}`, name: 'bash', args: {} }] }));
+    huge.push(toolResultEvent({ callId: `c${i}`, name: 'bash', ok: true, output: 'q'.repeat(6000) }));
+  }
+
+  const fromTokens = Math.floor(1_050_000 * 0.9 * 3.5);          // what the window suggests
+  const applied = Math.min(CODEX_MAX - 16_384, fromTokens);      // what must actually be used
+  check('the token-derived budget alone would be rejected', fromTokens > CODEX_MAX,
+    `${fromTokens.toLocaleString()} > ${CODEX_MAX.toLocaleString()}`);
+
+  const prompt = renderForPrompt(huge, { budgetChars: applied });
+  check('with the character ceiling the prompt fits', prompt.length < CODEX_MAX,
+    `${prompt.length.toLocaleString()} chars`);
+  check('and it still carries the conversation', prompt.includes('go'));
+}
+
 console.log(`\n${fail.length ? `${fail.length} FAILED` : 'all green'}`);
 process.exit(fail.length ? 1 : 0);

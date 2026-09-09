@@ -35,6 +35,10 @@ const state = {
 
 const cur = () => tabs[state.tab];
 
+// Images chosen but not yet sent. Uploaded immediately so the send is quick and
+// so a failed conversion is visible before you commit to the message.
+let pendingShots = [];
+
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 /**
@@ -98,6 +102,19 @@ function inline(chunk) {
 /** Applied to already-escaped text, so it can only add the markup it intends. */
 function emphasis(t) {
   return t
+    // Markdown links. A model handing back a file writes one constantly, and
+    // unrendered they spill an absolute path across several lines.
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, href) => {
+      // Only schemes that are safe to put in an href; a local path becomes a
+      // preview link into the harness rather than a dead file:// URL.
+      if (/^https?:\/\//i.test(href)) {
+        return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
+      }
+      if (href.startsWith('/')) {
+        return `<a href="/api/file?path=${encodeURIComponent(href)}" target="_blank" rel="noopener">${label}</a>`;
+      }
+      return label;   // relative or unknown: show the words, drop the link
+    })
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
@@ -167,7 +184,7 @@ function turnsFrom(events) {
   const turns = [];
   let cur = null;
   const start = (user) => {
-    cur = { user, steps: [], texts: [], notes: [], model: null };
+    cur = { user, steps: [], texts: [], notes: [], files: [], model: null };
     turns.push(cur);
     return cur;
   };
@@ -186,6 +203,8 @@ function turnsFrom(events) {
       else cur.steps.push({ call: { id: e.callId, name: e.name, args: {} }, result: e });
     } else if (e.type === 'note') {
       cur.notes.push(e);
+    } else if (e.type === 'files') {
+      cur.files.push(...(e.files ?? []));
     }
   }
   return turns;
@@ -322,7 +341,11 @@ function turnHtml(turn, i, running, number, isLast) {
     bits.push(`<div class="turn user">
       <div class="who"><span class="qn">${number}</span> you
         <span class="at">${clock(turn.user.ts)}</span></div>
-      <div class="bubble">${esc(turn.user.text)}</div>
+      <div class="bubble">${esc(turn.user.text)}${
+  (turn.user.attachments ?? []).length
+    ? `<div class="shots">${turn.user.attachments.map((a) =>
+      `<img src="/api/file?path=${encodeURIComponent(a.path)}" alt="${esc(a.name)}">`).join('')}</div>`
+    : ''}</div>
       ${cost.length ? `<div class="usage turn-cost">${cost.join(' · ')}</div>` : ''}</div>`);
   }
 
@@ -346,6 +369,28 @@ function turnHtml(turn, i, running, number, isLast) {
 
   const body = inner.join('').trim();
   if (!body) return bits.join('');
+
+  // Files the turn produced, shown as part of the reply rather than filed away
+  // somewhere else to be hunted for.
+  if (turn.files.length) {
+    const seen = new Set();
+    const unique = turn.files.filter((f) => !seen.has(f.path) && seen.add(f.path));
+    const shown = unique.slice(0, 12);
+    bits.push(`<div class="files">
+      ${shown.map((f) => `
+        <button class="file-card" data-open-file="${esc(f.path)}" data-file-kind="${f.kind}">
+          <span class="file-icon">${FILE_ICON[f.kind] ?? '📄'}</span>
+          <span class="file-meta">
+            <span class="file-name">${esc(f.rel || f.name)}</span>
+            <span class="file-sub">${humanSize(f.size)}</span>
+          </span>
+          <a class="file-dl" href="/api/file?path=${encodeURIComponent(f.path)}&download=1"
+             download="${esc(f.name)}" aria-label="Download">⤓</a>
+        </button>`).join('')}
+      ${unique.length > shown.length
+    ? `<div class="dim" style="padding:4px 2px">…and ${unique.length - shown.length} more</div>` : ''}
+    </div>`);
+  }
 
   const sum = foldSummary(turn, running);
   bits.push(`<button class="fold ${sum.tone}${running ? ' live' : ''}" data-fold="${esc(key)}">
@@ -425,6 +470,7 @@ async function openSession(id) {
   clearLive('monitor');
   setTab('chat');
   listen('chat', id);
+  refreshBackground();
   closeSheet();
 }
 
@@ -448,6 +494,11 @@ async function setTab(name) {
   $('panel').hidden = !monitoring;
   $('panel').classList.toggle('pinned', monitoring);
   document.body.classList.toggle('tab-monitor', monitoring);
+  // The monitoring tab is the monitoring view. Its chat is available when
+  // wanted rather than permanently occupying a third of the screen.
+  document.body.classList.toggle('chat-open', !monitoring || monitorChatOpen);
+  $('mon-chat-toggle').hidden = !monitoring;
+  $('mon-chat-toggle').textContent = monitorChatOpen ? 'hide chat ▾' : 'chat about this ▴';
 
   if (monitoring) {
     $('panel-body').hidden = false;
@@ -595,6 +646,7 @@ function listen(tab, id) {
         drawTranscript();
         refreshState();
         refreshPanel();
+        refreshBackground();
       }
       // A monitoring turn usually just changed the panel; show the result.
       if (tab === 'monitor') refreshPanel();
@@ -605,7 +657,9 @@ function listen(tab, id) {
 
 async function send() {
   const text = $('input').value.trim();
-  if (!text) return;
+  const shots = pendingShots.filter((a) => !a.uploading && a.path);
+  if (!text && !shots.length) return;
+  if (pendingShots.some((a) => a.uploading)) return showBanner('still uploading — one moment');
   const t = cur();
   if (!t.session) return showBanner('open a session first — tap ☰');
   if (t.running) return showBanner('a turn is already running — tap stop to interrupt it');
@@ -617,8 +671,13 @@ async function send() {
   try {
     await api(`/api/sessions/${t.session.id}/send`, {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        attachments: shots.map(({ name, path, mime, bytes }) => ({ name, path, mime, bytes })),
+      }),
     });
+    pendingShots = [];
+    paintPending();
   } catch (e) {
     setRunning(false);
     showBanner(e.message);
@@ -678,6 +737,7 @@ async function sessionsSheet() {
           (s) => `<div class="item${s.id === state.session?.id ? ' on' : ''}" data-open="${esc(s.id)}">
             <div class="grow"><div class="t">${esc(s.name)}</div>
             <div class="s">${esc(s.model)} · ${s.turns} turns · ${esc(shortDir(s.projectDir))}</div></div>
+            <button class="x" data-rename="${esc(s.id)}">✎</button>
             <button class="x" data-del="${esc(s.id)}">×</button></div>`,
         )
         .join('')
@@ -694,8 +754,26 @@ async function sessionsSheet() {
 
   $('sheet').querySelectorAll('[data-open]').forEach((el) => {
     el.onclick = (e) => {
-      if (e.target.dataset.del) return;
+      // Taps on the row's own buttons are theirs, not the row's.
+      if (e.target.dataset.del || e.target.dataset.rename) return;
       openSession(el.dataset.open);
+    };
+  });
+  $('sheet').querySelectorAll('[data-rename]').forEach((el) => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const id = el.dataset.rename;
+      const current = state.sessions.find((x) => x.id === id)?.name ?? '';
+      const name = prompt('Rename session', current);
+      if (!name?.trim() || name === current) return;
+      await api(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) });
+      if (state.session?.id === id) {
+        const fresh = await api(`/api/sessions/${id}`);
+        tabs.chat.session = fresh;
+        state.session = fresh;
+        paintHeader();
+      }
+      sessionsSheet();
     };
   });
   $('sheet').querySelectorAll('[data-del]').forEach((el) => {
@@ -830,6 +908,9 @@ async function settingsSheet() {
   const session = cur().session;
   openSheet(`
     ${session ? `<h2>This ${state.tab === 'monitor' ? 'monitoring ' : ''}session</h2>
+      <label>Name</label>
+      <div class="row"><input id="s-name" value="${esc(session.name ?? '')}" spellcheck="false" />
+      <button class="ghost" id="s-rename" style="flex:0 0 80px">rename</button></div>
       <label>Model — tap to switch, history carries over</label>
       <div id="s-models">${Object.values(state.models).map((m) => `
         <div class="item${m.alias === session.model ? ' on' : ''}" data-switch="${esc(m.alias)}">
@@ -869,11 +950,32 @@ async function settingsSheet() {
       <button class="ghost" id="s-browse" style="flex:0 0 92px">browse</button></div>
       <div class="actions"><button class="ghost" id="s-dir-save">save directory</button></div>` : ''}
 
+    <h3>Notify me when a turn finishes</h3>
+    <div id="s-notify"><p class="dim">loading…</p></div>
+
     <h3>Configure a model</h3>
     <p class="dim">Keys and endpoints — this does not switch anything.</p>${rows}
     <div class="actions"><button class="primary" id="s-close">done</button></div>`);
 
   $('s-close').onclick = closeSheet;
+  if ($('s-rename')) {
+    const rename = async () => {
+      const name = $('s-name').value.trim();
+      if (!name || name === session.name) return;
+      const updated = await api(`/api/sessions/${session.id}`, {
+        method: 'PATCH', body: JSON.stringify({ name }),
+      });
+      const t = cur();
+      t.session = updated;
+      if (state.tab === 'chat') state.session = updated;
+      paintHeader();
+      await refreshState();          // the ☰ list shows the old name otherwise
+      showBanner(`renamed to "${name}"`);
+    };
+    $('s-rename').onclick = rename;
+    // Enter should work too; a phone keyboard offers "done", not a button.
+    $('s-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); rename(); } });
+  }
   if ($('s-readable-save')) {
     $('s-readable-save').onclick = async () => {
       const dirs = $('s-readable').value.split('\n').map((x) => x.trim()).filter(Boolean);
@@ -887,6 +989,7 @@ async function settingsSheet() {
       settingsSheet();
     };
   }
+  if ($('s-notify')) paintNotify();
   if ($('s-git')) paintGit(session);
   $('sheet').querySelectorAll('[data-band]').forEach((el) => {
     el.onclick = async () => {
@@ -950,6 +1053,69 @@ async function setSessionModel(alias) {
   paintHeader();
 }
 
+/** Notification settings — global, not per session. */
+async function paintNotify() {
+  const box = $('s-notify');
+  if (!box) return;
+  let n;
+  try { n = await api('/api/notify'); } catch (e) { box.innerHTML = `<p class="dim">${esc(e.message)}</p>`; return; }
+
+  const kinds = [
+    ['messages', 'text message'],
+    ['webhook', 'webhook / push'],
+    ['command', 'shell command'],
+  ];
+  box.innerHTML = `
+    <div class="row">
+      <button class="ghost${n.enabled ? '' : ' on'}" data-notify="off">off</button>
+      <button class="ghost${n.enabled ? ' on' : ''}" data-notify="on">on</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      ${kinds.map(([k, label]) =>
+    `<button class="ghost${n.kind === k ? ' on' : ''}" data-nkind="${k}">${label}</button>`).join('')}
+    </div>
+    ${n.kind === 'messages'
+      ? `<label>Phone number</label><input id="n-to" value="${esc(n.to ?? '')}" placeholder="+18045551234" inputmode="tel" />`
+      : n.kind === 'webhook'
+        ? `<label>Webhook URL</label><input id="n-url" value="${esc(n.url ?? '')}" placeholder="https://ntfy.sh/your-topic" spellcheck="false" inputmode="url" />`
+        : `<label>Command (<span class="mono">{{message}}</span> is substituted)</label>
+           <input id="n-cmd" value="${esc(n.command ?? '')}" spellcheck="false" />`}
+    <label>Only for turns longer than</label>
+    <div class="row">
+      ${[0, 60, 300].map((sec) =>
+    `<button class="ghost${(n.minSeconds ?? 60) === sec ? ' on' : ''}" data-nmin="${sec}">${sec === 0 ? 'always' : `${sec / 60} min`}</button>`).join('')}
+    </div>
+    <div class="actions">
+      <button class="ghost" id="n-save">save</button>
+      <button class="ghost" id="n-test">send a test</button>
+    </div>`;
+
+  const patch = async (body) => { await api('/api/notify', { method: 'POST', body: JSON.stringify(body) }); paintNotify(); };
+  box.querySelectorAll('[data-notify]').forEach((el) => {
+    el.onclick = () => patch({ enabled: el.dataset.notify === 'on' });
+  });
+  box.querySelectorAll('[data-nkind]').forEach((el) => {
+    el.onclick = () => patch({ kind: el.dataset.nkind });
+  });
+  box.querySelectorAll('[data-nmin]').forEach((el) => {
+    el.onclick = () => patch({ minSeconds: Number(el.dataset.nmin) });
+  });
+
+  const fields = () => ({
+    ...($('n-to') ? { to: $('n-to').value.trim() } : {}),
+    ...($('n-url') ? { url: $('n-url').value.trim() } : {}),
+    ...($('n-cmd') ? { command: $('n-cmd').value.trim() } : {}),
+  });
+  $('n-save').onclick = async () => { await patch(fields()); showBanner('notification settings saved'); };
+  $('n-test').onclick = async () => {
+    $('n-test').textContent = 'sending…';
+    await api('/api/notify', { method: 'POST', body: JSON.stringify(fields()) });
+    const r = await api('/api/notify/test', { method: 'POST', body: JSON.stringify({}) });
+    showBanner(r.ok ? `sent (${r.via})` : `failed: ${r.reason}`);
+    paintNotify();
+  };
+}
+
 /**
  * Git panel for a session. Shows the repo as it really is, rather than assuming
  * — a missing remote is the usual reason a push silently does nothing.
@@ -984,6 +1150,7 @@ async function paintGit(session) {
       ${g.remote ? '' : `<label>Add a remote</label>
         <div class="row"><input id="g-remote" placeholder="git@github.com:you/repo.git" spellcheck="false" />
         <button class="ghost" id="g-connect" style="flex:0 0 80px">connect</button></div>`}
+      <div id="g-vis"></div>
       <div class="actions"><button class="ghost" id="g-now">commit &amp; push now</button></div>`;
   }
 
@@ -1008,6 +1175,35 @@ async function paintGit(session) {
       if (!r.ok) showBanner(r.error);
       paintGit(session);
     };
+  }
+  if ($('g-vis')) {
+    api('/api/git/visibility', { method: 'POST', body: JSON.stringify({ session: session.id }) })
+      .then((v) => {
+        const box = $('g-vis');
+        if (!box) return;
+        if (!v.ok) { box.innerHTML = `<p class="dim">${esc(v.reason)}</p>`; return; }
+        const pub = v.visibility === 'public';
+        box.innerHTML = `<p class="dim"><span class="mono">${esc(v.repo)}</span> is
+            <strong class="${pub ? 'warn-text' : ''}">${esc(v.visibility)}</strong></p>
+          <div class="row">
+            <button class="ghost${pub ? '' : ' on'}" data-vis="private">private</button>
+            <button class="ghost${pub ? ' on' : ''}" data-vis="public">public</button>
+          </div>`;
+        box.querySelectorAll('[data-vis]').forEach((el) => {
+          el.onclick = async () => {
+            const want = el.dataset.vis;
+            if (want === v.visibility) return;
+            if (want === 'public'
+              && !confirm(`Make ${v.repo} public? Anyone will be able to read it and its full history.`)) return;
+            const r = await api('/api/git/visibility', {
+              method: 'POST', body: JSON.stringify({ session: session.id, visibility: want }),
+            });
+            showBanner(r.ok ? `${v.repo} is now ${r.visibility}` : `could not change: ${r.reason}`);
+            paintGit(session);
+          };
+        });
+      })
+      .catch(() => {});
   }
   if ($('g-now')) {
     $('g-now').onclick = async () => {
@@ -1095,6 +1291,7 @@ function modelSheet(alias) {
 
 let panelTimer = null;
 let panelOpen = false;
+let monitorChatOpen = false;
 
 const agoText = (ms) => {
   const s = Math.round(ms / 1000);
@@ -1109,15 +1306,63 @@ const agoText = (ms) => {
  * the tab is never empty before anyone has asked for anything.
  */
 function renderActivity(d) {
+  // Two parts, always. The first is whatever the user chose to see; the second
+  // is what is actually running, which they did not choose and should not have
+  // to go looking for.
   const view = d.samples.find((sm) => sm.role === 'view');
-  if (view) {
-    return view.error
+  const monitors = d.samples.filter((sm) => sm.role !== 'view');
+
+  const yours = view
+    ? (view.error
       ? `<div class="mon"><div class="mon-head">${esc(view.label)}
            <span class="tool-status err">error</span></div>
          <pre class="mon-pre">${esc(view.error)}</pre></div>`
-      : `<div class="mon-html view">${view.html || ''}</div>`;
+      : `<div class="mon-html view">${view.html || ''}</div>`)
+    : monitors.length
+      ? monitors.map(monitorCard).join('')
+      : `<p class="dim mon-empty">Nothing set up yet — open the chat and ask for
+          whatever you want to watch: a log, a count, a progress table.</p>`;
+
+  const procs = d.procs.length
+    ? d.procs.map(procCard).join('')
+    : '<p class="dim mon-empty">No processes running for this session.</p>';
+
+  return `
+    <section class="mon-section">
+      <h4 class="mon-title">Your view</h4>
+      ${d.running ? `<div class="mon"><div class="mon-head">this session
+        <span class="tool-status pending">turn running${d.startedAt ? ` · ${agoText(Date.now() - d.startedAt)}` : ''}</span>
+        </div></div>` : ''}
+      ${yours}
+    </section>
+    <section class="mon-section">
+      <h4 class="mon-title">Background processes${d.procs.length ? ` · ${d.procs.length}` : ''}</h4>
+      ${procs}
+    </section>`;
+}
+
+function monitorCard(sm) {
+  if (sm.kind === 'panel') {
+    return `<div class="mon"><div class="mon-head">${esc(sm.label)}</div>
+      <div class="mon-html">${sm.error ? esc(sm.error) : (sm.html || '')}</div></div>`;
   }
-  return defaultActivity(d);
+  const badge = sm.kind === 'process'
+    ? `<span class="tool-status ${sm.count ? 'ok' : 'err'}">${sm.count ? `${sm.count} running` : 'stopped'}</span>`
+    : sm.ok === false ? '<span class="tool-status err">error</span>' : '';
+  return `<div class="mon"><div class="mon-head">${esc(sm.label)} ${badge}</div>
+    <pre class="mon-pre">${esc(sm.error ?? sm.text ?? '')}</pre></div>`;
+}
+
+function procCard(p) {
+  const idle = p.cpu < 0.5;
+  return `<div class="mon">
+    <div class="mon-head">${esc(p.command.split(' ').slice(0, 3).join(' '))}
+      <span class="tool-status ${idle ? 'pending' : 'ok'}">${p.cpu.toFixed(0)}% cpu</span></div>
+    <pre class="mon-pre">pid ${p.pid} · ${esc(p.etime)} · ${p.rssMb} MB${p.detached ? ' · detached' : ''}${p.log ? `\nlog: ${esc(p.log)}` : ''}</pre>
+    <div class="row" style="padding:0 10px 10px">
+      ${p.log ? `<button class="ghost" data-log="${esc(p.log)}">watch log</button>` : ''}
+      <button class="ghost" data-stop="${p.pid}">stop</button>
+    </div></div>`;
 }
 
 function defaultActivity(d) {
@@ -1202,88 +1447,6 @@ function stopPanelPolling() {
 
 let jobsTimer = null;
 
-async function jobsSheet() {
-  let d;
-  try {
-    d = await api('/api/procs');
-  } catch (e) {
-    return openSheet(`<h2>Background jobs</h2><p class="dim">${esc(e.message)}</p>`);
-  }
-
-  let mon = { monitors: [], samples: [] };
-  try { mon = await api('/api/monitors'); } catch { /* monitors are optional */ }
-
-  const monRows = mon.samples.length
-    ? mon.samples.map((sm) => {
-        const m = mon.monitors.find((x) => x.id === sm.id) ?? {};
-        const state = sm.ok === false
-          ? '<span class="tool-status err">error</span>'
-          : sm.kind === 'process'
-            ? `<span class="tool-status ${sm.count ? 'ok' : 'err'}">${sm.count ? `${sm.count} running` : 'not running'}</span>`
-            : sm.status
-              ? `<span class="tool-status ${sm.ok ? 'ok' : 'err'}">${sm.status}</span>`
-              : '<span class="tool-status ok">ok</span>';
-        return `<div class="item" style="display:block">
-          <div class="tool-head" style="padding:0">
-            <span class="tool-name">${esc(sm.label)}</span>
-            <span class="tool-arg">${esc(sm.kind)}</span>${state}</div>
-          <pre class="file-body" style="max-height:26vh;margin-top:8px">${esc(sm.error ? sm.error : (sm.text || '(no output)'))}</pre>
-          <div class="row" style="margin-top:8px">
-            ${m.kind === 'file' && m.path ? `<button class="ghost" data-log="${esc(m.path)}">watch</button>` : ''}
-            <button class="ghost" data-drop="${esc(sm.id)}">remove</button>
-          </div>
-        </div>`;
-      }).join('')
-    : `<p class="dim">No custom monitors yet. Ask a session to "monitor X" and it will add one — they live in <span class="mono">monitors.json</span>.</p>`;
-
-  const rows = d.procs.length
-    ? d.procs.map((p) => {
-        const idle = p.cpu < 0.5;
-        return `<div class="item" style="display:block">
-          <div class="t">${esc(p.command.split(' ').slice(0, 4).join(' '))}</div>
-          <div class="s">pid ${p.pid} · ${esc(p.etime)} · ${p.cpu.toFixed(1)}% cpu · ${p.rssMb} MB${p.detached ? ' · detached' : ''}</div>
-          ${idle ? '<div class="s warn-text">idle — 0% cpu, may be stalled or waiting</div>' : ''}
-          ${p.log ? `<div class="s">log: ${esc(p.log)}</div>` : '<div class="s">no log file found</div>'}
-          <div class="row" style="margin-top:8px">
-            ${p.log ? `<button class="ghost" data-log="${esc(p.log)}">watch log</button>` : ''}
-            <button class="ghost" data-stop="${p.pid}">stop</button>
-          </div>
-        </div>`;
-      }).join('')
-    : '<p class="dim">nothing running that the agent started</p>';
-
-  openSheet(`<h2>Monitors</h2>
-    ${monRows}
-    <h3>Detected processes</h3>
-    <p class="dim">Detached processes survive the turn that started them.</p>
-    ${rows}
-    <div class="actions">
-      <button class="ghost" id="j-refresh">refresh</button>
-      <button class="primary" id="j-close">done</button>
-    </div>`);
-
-  $('j-refresh').onclick = jobsSheet;
-  $('j-close').onclick = closeSheet;
-  $('sheet').querySelectorAll('[data-log]').forEach((el) => {
-    el.onclick = () => watchLog(el.dataset.log);
-  });
-  $('sheet').querySelectorAll('[data-drop]').forEach((el) => {
-    el.onclick = async () => {
-      if (!confirm(`Stop watching "${el.dataset.drop}"?`)) return;
-      await api('/api/monitors', { method: 'DELETE', body: JSON.stringify({ id: el.dataset.drop }) });
-      jobsSheet();
-    };
-  });
-  $('sheet').querySelectorAll('[data-stop]').forEach((el) => {
-    el.onclick = async () => {
-      const pid = Number(el.dataset.stop);
-      if (!confirm(`Stop process ${pid}?`)) return;
-      await api('/api/procs/stop', { method: 'POST', body: JSON.stringify({ pid }) });
-      jobsSheet();
-    };
-  });
-}
-
 /** Tail a log, refreshing on a timer, pinned to the newest line. */
 async function watchLog(file) {
   const name = file.split('/').pop();
@@ -1304,7 +1467,6 @@ async function watchLog(file) {
     <pre id="log-body" class="file-body">loading…</pre>
     <div class="actions">
       <button class="ghost" id="l-auto">auto-refresh</button>
-      <button class="ghost" id="l-back">back</button>
       <button class="primary" id="l-close">done</button>
     </div>`);
   await load();
@@ -1320,9 +1482,15 @@ async function watchLog(file) {
     }
   };
   const done = () => { clearInterval(jobsTimer); jobsTimer = null; };
-  $('l-back').onclick = () => { done(); jobsSheet(); };
   $('l-close').onclick = () => { done(); closeSheet(); };
 }
+
+$('mon-chat-toggle').onclick = () => {
+  monitorChatOpen = !monitorChatOpen;
+  document.body.classList.toggle('chat-open', monitorChatOpen);
+  $('mon-chat-toggle').textContent = monitorChatOpen ? 'hide chat ▾' : 'chat about this ▴';
+  if (monitorChatOpen) { drawTranscript(); scrollDown(true); $('input').focus(); }
+};
 
 document.querySelectorAll('.tab').forEach((el) => {
   el.onclick = () => {
@@ -1331,7 +1499,6 @@ document.querySelectorAll('.tab').forEach((el) => {
   };
 });
 
-$('jobs').onclick = jobsSheet;
 
 // ---------------------------------------------------------------- usage
 
@@ -1385,6 +1552,25 @@ async function usageSheet() {
         </div>`).join('')
     : `<p class="dim">No subscription report yet — it arrives with the first Claude turn after the server starts.</p>`;
 
+  const spend = d.models.reduce((n, m) => n + (m.cost || 0), 0);
+  const paid = d.models.filter((m) => m.cost > 0).sort((a, b) => b.cost - a.cost);
+  const money = (n) => (n >= 1 ? `$${n.toFixed(2)}` : n > 0 ? `$${n.toFixed(3)}` : '$0');
+
+  const spendPanel = `
+    <div class="spend">
+      <div class="spend-total">${money(spend)}</div>
+      <div class="spend-note">${esc(WINDOW_LABEL[d.window] ?? d.window)}${
+  paid.length ? '' : ' — nothing metered yet'}</div>
+      ${paid.map((m) => `
+        <div class="spend-row">
+          <span class="spend-name">${esc(m.label)}</span>
+          <span class="spend-bar"><span style="width:${((m.cost / spend) * 100).toFixed(0)}%"></span></span>
+          <span class="spend-amt">${money(m.cost)}</span>
+        </div>`).join('')}
+      ${d.models.some((m) => m.turns && !m.cost)
+    ? `<div class="spend-note">Subscription models bill nothing per token, so they show as $0.</div>` : ''}
+    </div>`;
+
   const rows = d.models.map((m) => {
     const limit = m.limit
       ? `<div class="meter"><div class="meter-head">
@@ -1392,11 +1578,14 @@ async function usageSheet() {
            <span class="mono">${(m.limit.pct * 100).toFixed(0)}%</span></div>
          ${bar(m.limit.pct, m.limit.pct > 0.9 ? 'hot' : m.limit.pct > 0.7 ? 'warm' : '')}</div>`
       : '';
-    const cost = m.cost > 0 ? ` · $${m.cost.toFixed(2)}` : '';
+    const cachedShare = m.input ? Math.min(100, Math.round((m.cached / m.input) * 100)) : 0;
     return `<div class="item" style="display:block">
-      <div class="t">${esc(m.label)}</div>
-      <div class="s">${esc(m.provider)} · ${m.turns} turns · ${m.sessions} sessions</div>
-      <div class="s">${num(m.input)} in · ${num(m.output)} out · ${num(m.cached)} cached · ${m.tools} tools · ${dur(m.ms)}${cost}</div>
+      <div class="tool-head" style="padding:0">
+        <span class="t" style="flex:1">${esc(m.label)}</span>
+        <span class="spend-amt">${m.cost > 0 ? money(m.cost) : '—'}</span>
+      </div>
+      <div class="s">${esc(m.provider)} · ${m.turns} turns</div>
+      <div class="s">${num(m.input)} in (${cachedShare}% cached) · ${num(m.output)} out · ${m.tools} tools · ${dur(m.ms)}</div>
       ${limit}
     </div>`;
   }).join('');
@@ -1407,6 +1596,8 @@ async function usageSheet() {
     </div>
     <h3>Account limits</h3>
     ${providerHtml}
+    <h3>Spend · ${esc(WINDOW_LABEL[d.window] ?? d.window)}</h3>
+    ${spendPanel}
     <h3>Measured by this app · ${esc(WINDOW_LABEL[d.window] ?? d.window)}</h3>
     ${rows}
     <p class="dim">Token counts are what the harness recorded across ${d.sessionCount} session(s). Add <span class="mono">limits</span> to a model in models.json to draw a ceiling.</p>
@@ -1560,6 +1751,54 @@ function screenSheet() {
 $('screen').onclick = screenSheet;
 $('menu').onclick = sessionsSheet;
 $('gear').onclick = settingsSheet;
+function paintPending() {
+  const box = $('pending');
+  box.hidden = pendingShots.length === 0;
+  box.innerHTML = pendingShots.map((a, i) => `
+    <div class="thumb${a.uploading ? ' busy' : ''}">
+      ${a.preview ? `<img src="${a.preview}" alt="">` : ''}
+      <button class="drop" data-drop-shot="${i}" aria-label="Remove">×</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-drop-shot]').forEach((el) => {
+    el.onclick = () => {
+      pendingShots.splice(Number(el.dataset.dropShot), 1);
+      paintPending();
+    };
+  });
+}
+
+$('attach').onclick = () => {
+  if (!cur().session) return showBanner('open a session first — tap ☰');
+  $('pick').click();
+};
+
+$('pick').onchange = async () => {
+  const files = [...$('pick').files];
+  $('pick').value = '';                       // so the same photo can be picked twice
+  const session = cur().session;
+  if (!session) return;
+
+  for (const file of files) {
+    const entry = { name: file.name, uploading: true, preview: URL.createObjectURL(file) };
+    pendingShots.push(entry);
+    paintPending();
+    try {
+      const res = await fetch(`/api/sessions/${session.id}/upload`, {
+        method: 'POST',
+        headers: { 'X-Filename': encodeURIComponent(file.name), 'Content-Type': 'application/octet-stream' },
+        body: file,
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? `upload failed (${res.status})`);
+      Object.assign(entry, body, { uploading: false });
+    } catch (e) {
+      pendingShots = pendingShots.filter((x) => x !== entry);
+      showBanner(e.message);
+    }
+    paintPending();
+  }
+};
+
 $('send').onclick = send;
 $('stop').onclick = () => api(`/api/sessions/${cur().session.id}/stop`, { method: 'POST' });
 
@@ -1599,6 +1838,13 @@ $('transcript').addEventListener('click', (e) => {
     return;
   }
 
+  const card = e.target.closest('.file-card');
+  if (card) {
+    if (e.target.closest('.file-dl')) return;   // let the download link do its job
+    viewFile(card.dataset.openFile, card.dataset.fileKind);
+    return;
+  }
+
   const chip = e.target.closest('.act');
   if (chip) {
     const detail = $(`act-${chip.dataset.act}`);
@@ -1625,8 +1871,42 @@ async function reconcile() {
   if (document.hidden || !state.session) return;
   try {
     await refreshState();
+    await refreshBackground();
   } catch {
     // offline for the moment; the next tick will try again
+  }
+}
+
+/**
+ * Background work belonging to this session, shown even when no turn is running.
+ *
+ * A turn finishing does not mean the session is idle — an agent can leave a
+ * crawler running behind it. Previously that was only visible by opening the
+ * monitoring tab, so a quiet chat tab looked like "nothing is happening" when
+ * something was.
+ */
+async function refreshBackground() {
+  const bar = $('background');
+  if (!bar || !state.session) return;
+  if (cur().running) { bar.hidden = true; return; }   // the working bar covers this
+
+  let d;
+  try {
+    d = await api(`/api/activity?session=${encodeURIComponent(state.session.id)}&raw=1`);
+  } catch {
+    return;
+  }
+  const busy = d.procs.filter((p) => p.cpu >= 0.5);
+  const idle = d.procs.length - busy.length;
+
+  bar.hidden = d.procs.length === 0;
+  if (d.procs.length) {
+    const names = d.procs.slice(0, 2).map((p) => p.command.split(' ').slice(0, 2).join(' ')).join(', ');
+    bar.innerHTML = `<span class="pulse-dot${busy.length ? '' : ' off'}"></span>
+      <span class="bg-label">${d.procs.length} background ${d.procs.length === 1 ? 'process' : 'processes'}
+        · ${esc(names)}${idle && !busy.length ? ' · idle' : ''}</span>
+      <span class="bg-more">monitoring ›</span>`;
+    bar.onclick = () => setTab('monitor');
   }
 }
 

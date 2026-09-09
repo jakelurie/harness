@@ -112,3 +112,41 @@ export async function connect(dir, remoteUrl) {
 }
 
 export const repoName = (dir) => path.basename(dir || '');
+
+/**
+ * Repository visibility, via the GitHub CLI.
+ *
+ * Kept behind `gh` rather than raw API calls so it uses whatever login the user
+ * already has, and returns a plain reason when it cannot rather than throwing.
+ */
+export async function visibility(dir) {
+  const st = await status(dir);
+  if (!st.repo || !st.remote) return { ok: false, reason: 'no remote' };
+
+  const res = await new Promise((resolve) => {
+    execFile('gh', ['repo', 'view', '--json', 'nameWithOwner,visibility,url'],
+      { cwd: st.root, timeout: 20_000 },
+      (err, stdout, stderr) => resolve({ ok: !err, out: stdout ?? '', err: stderr ?? '' }));
+  });
+  if (!res.ok) return { ok: false, reason: res.err.trim() || 'gh not available' };
+
+  try {
+    const j = JSON.parse(res.out);
+    return { ok: true, repo: j.nameWithOwner, visibility: (j.visibility ?? '').toLowerCase(), url: j.url };
+  } catch {
+    return { ok: false, reason: 'could not read repository info' };
+  }
+}
+
+export async function setVisibility(dir, want) {
+  const st = await status(dir);
+  if (!st.repo) return { ok: false, reason: 'not a git repository' };
+  if (!['public', 'private'].includes(want)) return { ok: false, reason: 'bad visibility' };
+
+  const res = await new Promise((resolve) => {
+    execFile('gh', ['repo', 'edit', `--visibility=${want}`, '--accept-visibility-change-consequences'],
+      { cwd: st.root, timeout: 30_000 },
+      (err, stdout, stderr) => resolve({ ok: !err, out: stdout ?? '', err: stderr ?? '' }));
+  });
+  return res.ok ? { ok: true, visibility: want } : { ok: false, reason: res.err.trim() || 'gh failed' };
+}

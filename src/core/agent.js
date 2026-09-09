@@ -7,11 +7,47 @@
  * with the whole history intact.
  */
 
+import { toDataUrl } from './attachments.js';
 import { clientFor, providerFor } from './providers/index.js';
 import { runTool } from './tools.js';
 import { assistantEvent, noteEvent, toolResultEvent, userEvent } from './transcript.js';
 
 const MAX_STEPS = 40;
+
+/**
+ * Run a tool, but never wait on it forever.
+ *
+ * Some calls block in ways nothing here can cancel - a macOS consent dialog for
+ * ~/Documents blocks readdir until somebody clicks it, and if the laptop lid is
+ * shut nobody can. Without this the whole turn wedges and Stop does nothing,
+ * because the loop only checks the abort signal between tools.
+ *
+ * The underlying operation cannot truly be cancelled; what changes is that the
+ * harness stops waiting on it, reports why, and stays responsive.
+ */
+async function boundedTool(call, ctx, { signal, ms }) {
+  let timer;
+  let onAbort;
+  try {
+    return await Promise.race([
+      runTool(call, ctx),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ ok: false, output: `timed out after ${Math.round(ms / 1000)}s — the tool did not return. If it touched ~/Documents, ~/Downloads or ~/Desktop, macOS may be waiting on a permission dialog.` }),
+          ms,
+        );
+      }),
+      new Promise((resolve) => {
+        if (signal?.aborted) return resolve({ ok: false, output: 'stopped by user' });
+        onAbort = () => resolve({ ok: false, output: 'stopped by user' });
+        signal?.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
+  }
+}
 
 const BASE_SYSTEM = `You are a capable assistant working with the user. You have tools to list, read, write and edit files, and to run shell commands in a project directory. You are not limited to coding: answer whatever the user actually asks.
 
@@ -108,7 +144,7 @@ export function systemPromptFor(session, monitorsFile, activityCmd) {
  * @param save     persists the session; awaited after every appended event
  */
 export async function runTurn({
-  session, models, userText, onEvent, onDelta, save, signal, monitorsFile, activityCmd,
+  session, models, userText, attachments, onEvent, onDelta, save, signal, monitorsFile, activityCmd,
 }) {
   const append = async (event) => {
     session.events.push(event);
@@ -117,7 +153,9 @@ export async function runTurn({
     return event;
   };
 
-  if (userText?.trim()) await append(userEvent(userText.trim()));
+  if (userText?.trim() || attachments?.length) {
+    await append(userEvent(userText?.trim() ?? '', attachments ?? []));
+  }
 
   for (let step = 0; step < MAX_STEPS; step += 1) {
     if (signal?.aborted) {
@@ -129,6 +167,17 @@ export async function runTurn({
     if (!spec) {
       await append(noteEvent(`model "${session.model}" is not in models.json`));
       return;
+    }
+
+    // Images are stored as files and only turned into base64 for the providers
+    // that inline them — the CLI reads the file itself, which is far cheaper.
+    let events = session.events;
+    if (spec.provider !== 'claude-cli' && events.some((e) => e.attachments?.length)) {
+      events = await Promise.all(events.map(async (e) => (
+        e.attachments?.length
+          ? { ...e, attachments: await Promise.all(e.attachments.map(async (a) => ({ ...a, dataUrl: await toDataUrl(a).catch(() => null) }))) }
+          : e
+      )));
     }
 
     let reply;
@@ -144,7 +193,7 @@ export async function runTurn({
       reply = await provider.complete({
         client: clientFor(spec),
         spec,
-        events: session.events,
+        events,
         system: systemPromptFor(session, monitorsFile, activityCmd),
         onText: (text) => onDelta?.({ kind: 'text', text }),
         onThinking: (text) => onDelta?.({ kind: 'thinking', text }),
@@ -205,11 +254,11 @@ export async function runTurn({
         continue;
       }
       onDelta?.({ kind: 'tool_start', call });
-      const result = await runTool(call, {
+      const result = await boundedTool(call, {
         projectDir: session.projectDir,
         allowOutside: !session.confineToProjectDir,
         readableDirs: session.readableDirs ?? [],
-      });
+      }, { signal, ms: spec.toolTimeoutMs ?? 120_000 });
       await append(
         toolResultEvent({ callId: call.id, name: call.name, ok: result.ok, output: result.output }),
       );

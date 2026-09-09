@@ -50,7 +50,46 @@ export async function save(userDataDir, state) {
   return state;
 }
 
-const blank = () => ({ turns: 0, input: 0, output: 0, cached: 0, ms: 0, tools: 0, cost: 0 });
+const blank = () => ({ turns: 0, input: 0, output: 0, cached: 0, cacheWrite: 0, ms: 0, tools: 0, cost: 0 });
+
+/**
+ * What one exchange actually cost.
+ *
+ * Three things a naive `input × price` gets wrong:
+ *
+ *  - Providers report `input` as the TOTAL, with `cached` a subset of it. The
+ *    cached part bills far cheaper, so charging full rate for it overstates the
+ *    bill badly - by about 6x on a session that reuses a long context.
+ *  - Cache writes are their own, higher rate.
+ *  - Some models price by band: past a threshold the WHOLE request reprices,
+ *    rather than only the excess.
+ */
+export function costOf(usage, spec) {
+  if (!spec?.priceIn && !spec?.priceOut) return 0;   // subscription models have no per-token price
+
+  // Older events recorded `input` excluding the cached part; if cached exceeds
+  // input that is what happened, so the true total is the sum. Without this,
+  // history is priced as though almost nothing was read.
+  const rawIn = usage?.input || 0;
+  const rawCached = usage?.cached || 0;
+  const input = rawCached > rawIn ? rawIn + rawCached : rawIn;
+  const cached = Math.min(rawCached, input);
+  const cacheWrite = usage?.cacheWrite || 0;
+  const output = usage?.output || 0;
+
+  const band = spec.longContextPricing;
+  const rates = band && input > (band.threshold ?? Infinity) ? band : spec;
+
+  const priceIn = rates.priceIn ?? spec.priceIn ?? 0;
+  const priceCached = rates.priceCached ?? (priceIn / 10);   // a sane default when unstated
+  const priceWrite = rates.priceCacheWrite ?? priceIn * 1.25;
+  const priceOut = rates.priceOut ?? spec.priceOut ?? 0;
+
+  return ((input - cached) * priceIn
+    + cached * priceCached
+    + cacheWrite * priceWrite
+    + output * priceOut) / 1e6;
+}
 
 /**
  * Fold a session's new events into the buckets. Returns how many were added.
@@ -81,17 +120,18 @@ export function ingestSession(state, session, models) {
     const b = (state.buckets[key] ||= blank());
 
     b.turns += 1;
-    b.input += e.usage?.input || 0;
+    // Older events recorded `input` excluding the cached part; newer ones
+    // include it. Normalise to the total so a cached share is meaningful.
+    const rawIn = e.usage?.input || 0;
+    const rawCached = e.usage?.cached || 0;
+    b.input += rawCached > rawIn ? rawIn + rawCached : rawIn;
     b.output += e.usage?.output || 0;
-    b.cached += e.usage?.cached || 0;
+    b.cached += rawCached;
+    b.cacheWrite += e.usage?.cacheWrite || 0;
     b.ms += e.usage?.ms || 0;
     b.tools += (e.toolCalls || []).length;
 
-    const spec = models?.[alias];
-    if (spec?.priceIn || spec?.priceOut) {
-      b.cost += ((e.usage?.input || 0) * (spec.priceIn || 0)
-        + (e.usage?.output || 0) * (spec.priceOut || 0)) / 1e6;
-    }
+    b.cost += costOf(e.usage, models?.[alias]);
     added += 1;
   }
 

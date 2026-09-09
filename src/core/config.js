@@ -102,7 +102,7 @@ export async function loadConfig(userDataDir) {
     const isLocal = block.provider === 'openai' && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(block.baseUrl ?? '');
 
     // The `claude` CLI carries its own credentials; the harness never holds one.
-    const selfAuth = block.provider === 'claude-cli';
+    const selfAuth = block.provider === 'claude-cli' || block.provider === 'codex-cli';
 
     models[alias] = {
       alias,

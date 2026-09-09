@@ -23,7 +23,9 @@ import { runTurn } from '../src/core/agent.js';
 import { loadConfig, patchModel } from '../src/core/config.js';
 import { resetClients } from '../src/core/providers/index.js';
 import { setSecret } from '../src/core/secrets.js';
+import * as attachments from '../src/core/attachments.js';
 import * as git from '../src/core/git.js';
+import { loadNotify, saveNotify, send as sendNotify, summarise } from '../src/core/notify.js';
 import * as store from '../src/core/store.js';
 import { noteEvent, tally } from '../src/core/transcript.js';
 import { normalizeProviderLimits, WINDOWS } from '../src/core/usage.js';
@@ -160,6 +162,49 @@ function broadcast(sessionId, payload) {
 }
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
+
+// Directories that are never a session's output and would swamp the useful
+// results if walked.
+const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__',
+  'dist', 'build', '.next', '.cache', 'Library', 'screenshots', 'html']);
+
+/** Files under `root` modified at or after `since`, newest first. */
+async function filesChangedSince(root, since, max = 400) {
+  const out = [];
+
+  async function walk(dir, depth) {
+    if (depth > 6 || out.length >= max) return;
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;   // unreadable or vanished — not fatal
+    }
+    for (const e of entries) {
+      if (out.length >= max) return;
+      if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full, depth + 1);
+      } else if (e.isFile()) {
+        const st = await fs.stat(full).catch(() => null);
+        if (st && st.mtimeMs >= since) {
+          out.push({
+            name: e.name,
+            path: full,
+            rel: path.relative(root, full),
+            size: st.size,
+            modified: st.mtimeMs,
+            kind: kindOf(e.name),
+          });
+        }
+      }
+    }
+  }
+
+  await walk(root, 0);
+  return out.sort((a, b) => b.modified - a.modified);
+}
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico', '.avif']);
 const TEXT_EXT = new Set([
@@ -393,6 +438,20 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ---- notifications
+    if (req.method === 'GET' && pathname === '/api/notify') {
+      return json(res, 200, await loadNotify(USER_DATA));
+    }
+    if (req.method === 'POST' && pathname === '/api/notify') {
+      const body = await readBody(req);
+      const cfg = await saveNotify(USER_DATA, { ...(await loadNotify(USER_DATA)), ...body });
+      return json(res, 200, cfg);
+    }
+    if (req.method === 'POST' && pathname === '/api/notify/test') {
+      const cfg = { ...(await loadNotify(USER_DATA)), ...(await readBody(req)), enabled: true };
+      return json(res, 200, await sendNotify(cfg, 'Harness test — notifications are working.'));
+    }
+
     // ---- git
     if (req.method === 'GET' && pathname === '/api/git') {
       const id = url.searchParams.get('session');
@@ -406,6 +465,15 @@ const server = http.createServer(async (req, res) => {
       const session = live.get(id) ?? (await store.load(id, { repair: false }));
       const res2 = await git.connect(session.projectDir, remote);
       return json(res, res2.ok ? 200 : 400, res2);
+    }
+
+    if (req.method === 'POST' && pathname === '/api/git/visibility') {
+      const { session: id, visibility } = await readBody(req);
+      const session = live.get(id) ?? (await store.load(id, { repair: false }));
+      const res2 = visibility
+        ? await git.setVisibility(session.projectDir, visibility)
+        : await git.visibility(session.projectDir);
+      return json(res, 200, res2);
     }
 
     if (req.method === 'POST' && pathname === '/api/git/push') {
@@ -598,10 +666,16 @@ const server = http.createServer(async (req, res) => {
       }
 
       const body = await fs.readFile(file);
+      const download = url.searchParams.get('download') === '1';
       res.writeHead(200, {
-        'Content-Type': MIME_FILE[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'Content-Type': download
+          ? 'application/octet-stream'
+          : MIME_FILE[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
         'Content-Length': body.length,
         'Cache-Control': 'no-store',
+        ...(download
+          ? { 'Content-Disposition': `attachment; filename="${path.basename(file).replace(/"/g, '')}"` }
+          : {}),
       });
       return res.end(body);
     }
@@ -760,15 +834,37 @@ const server = http.createServer(async (req, res) => {
         return undefined;
       }
 
+      // Raw-bytes upload. Multipart would mean a parser and an extra
+      // dependency for no benefit; the filename rides in a header.
+      if (req.method === 'POST' && id && verb === 'upload') {
+        const chunks = [];
+        let size = 0;
+        for await (const c of req) {
+          size += c.length;
+          if (size > attachments.MAX_BYTES) return json(res, 413, { error: 'image too large (25 MB limit)' });
+          chunks.push(c);
+        }
+        if (!size) return json(res, 400, { error: 'empty upload' });
+
+        const name = decodeURIComponent(String(req.headers['x-filename'] ?? 'image.jpg'));
+        try {
+          const att = await attachments.store(USER_DATA, id, { name, buffer: Buffer.concat(chunks) });
+          return json(res, 200, att);
+        } catch (e) {
+          return json(res, 400, { error: e?.message ?? String(e) });
+        }
+      }
+
       if (req.method === 'POST' && id && verb === 'send') {
         if (running.has(id)) return json(res, 409, { error: 'a turn is already running' });
 
-        const { text } = await readBody(req);
+        const { text, attachments: atts } = await readBody(req);
         const session = await store.load(id);
         live.set(id, session);
         const cfg = await loadConfig(USER_DATA);
         if (cfg.error) return json(res, 400, { error: cfg.error });
 
+        const sentAt = session.events.length;
         const controller = new AbortController();
         const turn = { controller, startedAt: Date.now(), last: null };
         running.set(id, turn);
@@ -778,6 +874,7 @@ const server = http.createServer(async (req, res) => {
           session,
           models: cfg.models,
           userText: text,
+          attachments: Array.isArray(atts) ? atts : [],
           signal: controller.signal,
           save: (s) => store.save(s),
           monitorsFile: monitorsPath(USER_DATA),
@@ -833,8 +930,50 @@ const server = http.createServer(async (req, res) => {
               }
             }
 
+            // What this turn actually produced. Asking for a file and then
+            // hunting for it is the thing this avoids: it is attached to the
+            // reply that made it.
+            try {
+              const made = await filesChangedSince(session.projectDir, turn.startedAt, 30);
+              if (made.length) {
+                session.events.push({
+                  id: `f_${Date.now().toString(36)}`,
+                  ts: Date.now(),
+                  type: 'files',
+                  files: made,
+                });
+                await store.save(session);
+                broadcast(id, { kind: 'event', event: session.events.at(-1) });
+              }
+            } catch { /* a scan failure must not affect the turn */ }
+
             broadcast(id, { kind: 'done' });
             collectUsage().catch(() => {}); // fold the turn in; never block the reply
+
+            // Tell the user it finished. Deliberately after `done`, and never
+            // awaited by anything that matters: a notifier is not allowed to
+            // delay or break a turn.
+            (async () => {
+              const cfg = await loadNotify(USER_DATA);
+              const seconds = (Date.now() - turn.startedAt) / 1000;
+              if (!cfg.enabled || seconds < (cfg.minSeconds ?? 0)) return;
+
+              const since = session.events.slice(sentAt);
+              const last = [...since].reverse().find((e) => e.type === 'assistant' && e.text?.trim());
+              const res = await sendNotify(cfg, summarise({
+                sessionName: session.name,
+                model: session.model,
+                steps: since.filter((e) => e.type === 'tool_result').length,
+                seconds,
+                failed: since.some((e) => e.type === 'note' && /error|failed/i.test(e.text)),
+                lastText: last?.text,
+              }));
+              if (!res.ok) {
+                session.events.push(noteEvent(`notify: ${res.reason}`));
+                await store.save(session);
+                broadcast(id, { kind: 'event', event: session.events.at(-1) });
+              }
+            })().catch(() => {});
           });
         return undefined;
       }
