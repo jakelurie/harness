@@ -1535,72 +1535,66 @@ async function usageSheet() {
     return openSheet(`<h2>Usage</h2><p class="dim">${esc(e.message)}</p>`);
   }
 
-  // What the provider reports about the account as a whole.
-  const provider = Object.entries(d.provider ?? {});
-  const providerHtml = provider.length
-    ? provider.map(([alias, p]) => `
-        <div class="item" style="display:block">
-          <div class="t">${esc(state.models[alias]?.label ?? alias)}</div>
-          <div class="s">subscription — counts all Claude use, not just this app</div>
-          ${(p.windows ?? []).map((w) => `
-            <div class="meter">
-              <div class="meter-head"><span>${esc(WINDOW_LABEL[w.name] ?? w.name)}</span>
-                <span class="mono">${(w.pct * 100).toFixed(w.pct < 0.1 ? 1 : 0)}%</span></div>
-              ${bar(w.pct, w.pct > 0.9 ? 'hot' : w.pct > 0.7 ? 'warm' : '')}
-              <div class="s">${esc(untilReset(w.resetsAt))}</div>
-            </div>`).join('')}
-        </div>`).join('')
-    : `<p class="dim">No subscription report yet — it arrives with the first Claude turn after the server starts.</p>`;
-
-  const spend = d.models.reduce((n, m) => n + (m.cost || 0), 0);
-  const paid = d.models.filter((m) => m.cost > 0).sort((a, b) => b.cost - a.cost);
   const money = (n) => (n >= 1 ? `$${n.toFixed(2)}` : n > 0 ? `$${n.toFixed(3)}` : '$0');
+  const spend = d.models.reduce((n, m) => n + (m.cost || 0), 0);
 
-  const spendPanel = `
-    <div class="spend">
-      <div class="spend-total">${money(spend)}</div>
-      <div class="spend-note">${esc(WINDOW_LABEL[d.window] ?? d.window)}${
-  paid.length ? '' : ' — nothing metered yet'}</div>
-      ${paid.map((m) => `
-        <div class="spend-row">
-          <span class="spend-name">${esc(m.label)}</span>
-          <span class="spend-bar"><span style="width:${((m.cost / spend) * 100).toFixed(0)}%"></span></span>
-          <span class="spend-amt">${money(m.cost)}</span>
-        </div>`).join('')}
-      ${d.models.some((m) => m.turns && !m.cost)
-    ? `<div class="spend-note">Subscription models bill nothing per token, so they show as $0.</div>` : ''}
-    </div>`;
+  /**
+   * One card per model, all the same weight.
+   *
+   * Only some backends report a limit. Claude Code sends real window
+   * utilisation; the Codex CLI reports token counts but no rate-limit figure at
+   * all, and a metered API has no ceiling to show. Rather than inventing a
+   * percentage for the ones that do not publish one, each card says what is
+   * actually known about it.
+   */
+  const card = (m) => {
+    const p = d.provider?.[m.alias];
+    const windows = p?.windows ?? [];
 
-  const rows = d.models.map((m) => {
-    const limit = m.limit
-      ? `<div class="meter"><div class="meter-head">
-           <span>${m.limit.kind === 'cost' ? 'budget' : 'token limit'}</span>
-           <span class="mono">${(m.limit.pct * 100).toFixed(0)}%</span></div>
-         ${bar(m.limit.pct, m.limit.pct > 0.9 ? 'hot' : m.limit.pct > 0.7 ? 'warm' : '')}</div>`
-      : '';
+    let limit;
+    if (windows.length) {
+      limit = windows.map((w) => `
+        <div class="meter">
+          <div class="meter-head"><span>${esc(WINDOW_LABEL[w.name] ?? w.name)}</span>
+            <span class="mono">${(w.pct * 100).toFixed(w.pct < 0.1 ? 1 : 0)}%</span></div>
+          ${bar(w.pct, w.pct > 0.9 ? 'hot' : w.pct > 0.7 ? 'warm' : '')}
+          <div class="s">${esc(untilReset(w.resetsAt))}</div>
+        </div>`).join('');
+    } else if (m.provider === 'codex-cli') {
+      limit = `<p class="s">Plan limits apply, but the Codex CLI does not report how much is left.
+        <a href="https://chatgpt.com/codex/settings/usage" target="_blank" rel="noopener">check on chatgpt.com</a></p>`;
+    } else if (m.provider === 'claude-cli') {
+      limit = '<p class="s">Plan limits apply — the figure arrives with this model\'s next turn.</p>';
+    } else if (m.limit) {
+      limit = `<div class="meter">
+        <div class="meter-head"><span>${m.limit.kind === 'cost' ? 'budget' : 'token limit'}</span>
+          <span class="mono">${(m.limit.pct * 100).toFixed(0)}%</span></div>
+        ${bar(m.limit.pct, m.limit.pct > 0.9 ? 'hot' : m.limit.pct > 0.7 ? 'warm' : '')}</div>`;
+    } else {
+      limit = '<p class="s">Metered — no ceiling. You pay per token.</p>';
+    }
+
     const cachedShare = m.input ? Math.min(100, Math.round((m.cached / m.input) * 100)) : 0;
-    return `<div class="item" style="display:block">
+    return `<div class="item usage-card">
       <div class="tool-head" style="padding:0">
         <span class="t" style="flex:1">${esc(m.label)}</span>
-        <span class="spend-amt">${m.cost > 0 ? money(m.cost) : '—'}</span>
+        <span class="spend-amt">${m.cost > 0 ? money(m.cost) : m.turns ? 'no charge' : '—'}</span>
       </div>
-      <div class="s">${esc(m.provider)} · ${m.turns} turns</div>
-      <div class="s">${num(m.input)} in (${cachedShare}% cached) · ${num(m.output)} out · ${m.tools} tools · ${dur(m.ms)}</div>
+      <div class="s">${esc(m.provider)} · ${m.turns} turns · ${num(m.input)} in (${cachedShare}% cached) · ${num(m.output)} out</div>
       ${limit}
     </div>`;
-  }).join('');
+  };
+
+  // Used first, then the rest — but every card is the same size and shape.
+  const ordered = [...d.models].sort((a, b) => b.turns - a.turns);
 
   openSheet(`<h2>Usage</h2>
     <div class="row" style="margin-bottom:12px">
       ${d.windows.map((w) => `<button class="ghost win${w === d.window ? ' on' : ''}" data-win="${w}">${esc(WINDOW_LABEL[w] ?? w)}</button>`).join('')}
     </div>
-    <h3>Account limits</h3>
-    ${providerHtml}
-    <h3>Spend · ${esc(WINDOW_LABEL[d.window] ?? d.window)}</h3>
-    ${spendPanel}
-    <h3>Measured by this app · ${esc(WINDOW_LABEL[d.window] ?? d.window)}</h3>
-    ${rows}
-    <p class="dim">Token counts are what the harness recorded across ${d.sessionCount} session(s). Add <span class="mono">limits</span> to a model in models.json to draw a ceiling.</p>
+    ${ordered.map(card).join('')}
+    <p class="dim">${money(spend)} metered spend in this window. Subscription models bill against
+      their plan instead, so they show no charge.</p>
     <div class="actions"><button class="primary" id="u-close">done</button></div>`);
 
   $('u-close').onclick = closeSheet;

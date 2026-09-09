@@ -58,6 +58,12 @@ export async function complete({
     // The harness already decides what a session may touch; Codex's own
     // sandbox would refuse writes the user has asked for.
     ...(spec.sandbox === false ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+    // The prompt argument is the agent's instructions; piped stdin is appended
+    // as a <stdin> block. So the harness's system prompt goes here and the
+    // transcript goes down the pipe. Without this the session ran on Codex's
+    // own defaults and never received any of the harness's instructions —
+    // including the one telling it to finish with a clear outcome.
+    ...(system ? [system] : []),
   ];
 
   const started = Date.now();

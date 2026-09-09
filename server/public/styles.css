@@ -665,3 +665,7 @@ body.tab-monitor.chat-open #transcript { flex: 2 1 0; min-height: 0; }
 
 .turn.assistant .body a { color: var(--accent); text-decoration: underline; overflow-wrap: anywhere; }
 
+
+.usage-card { display: block; }
+.usage-card .meter { margin: 12px 0 2px; }
+.usage-card .s a { color: var(--accent); }
