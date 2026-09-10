@@ -152,14 +152,20 @@ export function toAnthropic(events) {
     flush();
 
     if (e.type === 'user') {
-      const imgs = (e.attachments ?? []).filter((a) => a.dataUrl);
-      if (!e.text && !imgs.length) continue;
+      const atts = e.attachments ?? [];
+      const imgs = atts.filter((a) => a.dataUrl && a.role !== 'document');
+      const docs = atts.filter((a) => a.base64 && a.role === 'document');
+      if (!e.text && !imgs.length && !docs.length) continue;
       messages.push({
         role: 'user',
         content: [
           ...imgs.map((a) => ({
             type: 'image',
             source: { type: 'base64', media_type: a.mime, data: a.dataUrl.split(',')[1] },
+          })),
+          ...docs.map((a) => ({
+            type: 'document',
+            source: { type: 'base64', media_type: a.mime, data: a.base64 },
           })),
           ...(e.text ? [{ type: 'text', text: e.text }] : []),
         ],
@@ -285,7 +291,9 @@ export function renderForPrompt(events, { budgetChars = Infinity, keepRecent = 1
     if (e.type === 'user') {
       // The CLI has its own file tools, so a path is more useful (and far
       // cheaper) than inlining the image.
-      const files = (e.attachments ?? []).map((a) => `[attached image: ${a.path}]`).join('\n');
+      const files = (e.attachments ?? [])
+        .map((a) => `[attached ${a.role === 'document' ? 'file' : 'image'}: ${a.path}]`)
+        .join('\n');
       blocks.push({ kind: 'user', text: `## User\n${[e.text, files].filter(Boolean).join('\n')}` });
     } else if (e.type === 'assistant') {
       const bits = [];
@@ -415,13 +423,20 @@ export function toResponses(events) {
   const input = [];
   for (const e of sendable(events)) {
     if (e.type === 'user') {
-      const imgs = (e.attachments ?? []).filter((a) => a.dataUrl);
-      input.push(imgs.length
+      const atts = e.attachments ?? [];
+      const imgs = atts.filter((a) => a.dataUrl && a.role !== 'document');
+      const docs = atts.filter((a) => a.base64 && a.role === 'document');
+      input.push(imgs.length || docs.length
         ? {
           role: 'user',
           content: [
             ...(e.text ? [{ type: 'input_text', text: e.text }] : []),
             ...imgs.map((a) => ({ type: 'input_image', image_url: a.dataUrl })),
+            ...docs.map((a) => ({
+              type: 'input_file',
+              filename: a.name,
+              file_data: `data:${a.mime};base64,${a.base64}`,
+            })),
           ],
         }
         : { role: 'user', content: e.text });

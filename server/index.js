@@ -29,6 +29,12 @@ import { loadNotify, saveNotify, send as sendNotify, summarise } from '../src/co
 import * as store from '../src/core/store.js';
 import { noteEvent, tally } from '../src/core/transcript.js';
 import { normalizeProviderLimits, WINDOWS } from '../src/core/usage.js';
+import * as codexCli from '../src/core/providers/codex-cli.js';
+import { refuseAsProjectDir } from '../src/core/harness-guard.js';
+import { loadEmailConfig, saveEmailConfig } from '../src/core/email-config.js';
+import * as apps from '../src/core/apps.js';
+import { createBeacons, wedgeMessage, DEFAULT_STALL_MS } from '../src/core/beacon.js';
+import { sendEmail } from '../src/core/email.js';
 import * as usageStore from '../src/core/usage-store.js';
 import {
   KINDS, loadMonitors, monitorsPath, removeMonitor, sampleAll, upsertMonitor,
@@ -89,6 +95,7 @@ async function collectUsage({ force = false } = {}) {
 const running = new Map();   // sessionId -> { controller, startedAt, last }
 const live = new Map();      // sessionId -> the session object a turn is mutating
 const providerLimits = new Map(); // model alias -> its last reported rate-limit info
+const beacons = createBeacons();  // per-turn liveness, so a stall cannot stay invisible
 const listeners = new Map(); // sessionId -> Set<ServerResponse>
 
 /**
@@ -154,6 +161,12 @@ function authorized(req, url) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/** A short label for what a tool was doing, so a stall names its own cause. */
+function describeArg(call) {
+  const a = call?.args ?? {};
+  return String(a.command ?? a.path ?? '').slice(0, 60);
+}
+
 function broadcast(sessionId, payload) {
   const set = listeners.get(sessionId);
   if (!set) return;
@@ -165,8 +178,31 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
 
 // Directories that are never a session's output and would swamp the useful
 // results if walked.
-const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__',
-  'dist', 'build', '.next', '.cache', 'Library', 'screenshots', 'html']);
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', '.venv', 'venv', '__pycache__',
+  'dist', 'build', '.next', '.cache', 'screenshots', 'html',
+  // macOS guards these behind a consent dialog. Reading one blocks until
+  // somebody clicks it, and with the lid shut nobody can — which exhausts
+  // libuv's threadpool and takes the whole server down with it. A session
+  // rooted at ~ walks straight into them.
+  'Library', 'Documents', 'Downloads', 'Desktop', 'Movies', 'Music', 'Pictures',
+  'Applications', 'Public', 'Sites', 'iCloud Drive (Archive)',
+]);
+
+/** A directory read that gives up rather than blocking on a consent dialog. */
+async function readdirBounded(dir, ms = 3000) {
+  let timer;
+  try {
+    return await Promise.race([
+      fs.readdir(dir, { withFileTypes: true }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Files under `root` modified at or after `since`, newest first. */
 async function filesChangedSince(root, since, max = 400) {
@@ -174,12 +210,8 @@ async function filesChangedSince(root, since, max = 400) {
 
   async function walk(dir, depth) {
     if (depth > 6 || out.length >= max) return;
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;   // unreadable or vanished — not fatal
-    }
+    const entries = await readdirBounded(dir);
+    if (!entries) return;   // unreadable, vanished, or waiting on a permission dialog
     for (const e of entries) {
       if (out.length >= max) return;
       if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue;
@@ -292,6 +324,8 @@ const server = http.createServer(async (req, res) => {
         turns: Object.fromEntries(
           [...running.entries()].map(([k, v]) => [k, { startedAt: v.startedAt, last: v.last }]),
         ),
+        // Liveness, not just "is it running": a turn can be running and stuck.
+        beacons: Object.fromEntries(beacons.all().map((b) => [b.sessionId, b])),
       });
     }
 
@@ -404,7 +438,7 @@ const server = http.createServer(async (req, res) => {
       // anything: ask each candidate where it is working.
       const procs = [];
       await Promise.all(candidates.map((proc) => new Promise((resolve) => {
-        execFile('lsof', ['-p', String(proc.pid), '-a', '-d', 'cwd,1', '-Fn'], { timeout: 5000 },
+        execFile('lsof', ['-p', String(proc.pid), '-a', '-d', 'cwd,1', '-Fn'], { timeout: 3000 },
           (err, out) => {
             if (!err) {
               const names = (out ?? '').split('\n').filter((l) => l.startsWith('n/')).map((l) => l.slice(1));
@@ -439,6 +473,77 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- notifications
+    // ---- apps: the durable things sessions attach to
+    const appMatch = pathname.match(/^\/api\/apps(?:\/([^/]+))?(?:\/(\w+))?$/);
+    if (appMatch) {
+      const [, appId, verb] = appMatch;
+
+      if (req.method === 'GET' && !appId) {
+        return json(res, 200, { apps: await apps.listWithStatus(USER_DATA) });
+      }
+      if (req.method === 'POST' && !appId) {
+        const body = await readBody(req);
+        try { return json(res, 200, await apps.create(USER_DATA, body)); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'PATCH' && appId) {
+        try { return json(res, 200, await apps.update(USER_DATA, appId, await readBody(req))); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'DELETE' && appId) {
+        // Sessions outlive the app record; they simply become unattached
+        // rather than being deleted along with it.
+        const sessions = await store.list();
+        for (const meta of sessions) {
+          if (meta.appId !== appId) continue;
+          const sn = await store.load(meta.id, { repair: false }).catch(() => null);
+          if (sn) { sn.appId = null; await store.save(sn); }
+        }
+        return json(res, 200, { apps: await apps.remove(USER_DATA, appId) });
+      }
+      if (req.method === 'POST' && appId && verb === 'start') {
+        try {
+          const r = await apps.start(USER_DATA, appId);
+          return json(res, 200, { ...r, urls: apps.urlsFor(r.app, await apps.tailnetHost()) });
+        } catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'POST' && appId && verb === 'stop') {
+        try { return json(res, 200, await apps.stop(USER_DATA, appId)); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'GET' && appId && verb === 'log') {
+        const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
+        if (!app) return json(res, 404, { error: 'no such app' });
+        const text = await fs.readFile(apps.logPath(USER_DATA, app), 'utf8').catch(() => '');
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(text.slice(-40_000));
+      }
+    }
+
+    // ---- outbound email, available to every session as a tool
+    if (req.method === 'GET' && pathname === '/api/email') {
+      const cfg = await loadEmailConfig(USER_DATA);
+      // The key itself never leaves the machine; only whether there is one.
+      return json(res, 200, { to: cfg.to, from: cfg.from, hasKey: Boolean(cfg.apiKey) });
+    }
+    if (req.method === 'POST' && pathname === '/api/email') {
+      const { to, from, apiKey } = await readBody(req);
+      const cfg = await saveEmailConfig(USER_DATA, { to, from, apiKey });
+      return json(res, 200, { to: cfg.to, from: cfg.from, hasKey: Boolean(cfg.apiKey) });
+    }
+    if (req.method === 'POST' && pathname === '/api/email/test') {
+      try {
+        const cfg = await loadEmailConfig(USER_DATA);
+        const sent = await sendEmail(cfg, {
+          subject: 'harness test',
+          text: 'This is the harness checking it can reach you. Every session can send mail this way.',
+        });
+        return json(res, 200, { ok: true, ...sent });
+      } catch (e) {
+        return json(res, 400, { error: e.message });
+      }
+    }
+
     if (req.method === 'GET' && pathname === '/api/notify') {
       return json(res, 200, await loadNotify(USER_DATA));
     }
@@ -590,6 +695,21 @@ const server = http.createServer(async (req, res) => {
         provider[alias] = { ...normalizeProviderLimits(saved.info), reportedAt: saved.at };
       }
 
+      // Codex reports plan usage to its rollout files rather than down its
+      // stream, and that figure covers the whole account. So a Codex model
+      // that has not run a turn here yet can still show a true percentage,
+      // rather than an empty card promising one after the next turn.
+      const needsCodex = Object.entries(cfg.models)
+        .filter(([alias, spec]) => spec.provider === 'codex-cli' && !provider[alias]);
+      if (needsCodex.length) {
+        const info = await codexCli.latestRateLimits().catch(() => null);
+        if (info) {
+          for (const [alias] of needsCodex) {
+            provider[alias] = { ...normalizeProviderLimits(info), reportedAt: null };
+          }
+        }
+      }
+
       return json(res, 200, {
         window,
         windows: Object.keys(WINDOWS),
@@ -725,11 +845,22 @@ const server = http.createServer(async (req, res) => {
       const [, id, verb] = m;
 
       if (req.method === 'POST' && !id) {
-        const { name, model, projectDir, system, mode } = await readBody(req);
+        const { name, model, projectDir: askedDir, system, mode, appId } = await readBody(req);
+        // An app owns its directory; a session attached to one works there
+        // rather than carrying a directory of its own.
+        let projectDir = askedDir;
+        if (appId) {
+          const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
+          if (!app) return json(res, 400, { error: 'no such app' });
+          projectDir = app.dir;
+        }
+        // A session may not be rooted where it could modify the harness.
+        const refusal = refuseAsProjectDir(projectDir);
+        if (refusal) return json(res, 400, { error: refusal });
         // Typing a path that does not exist yet is a normal thing to do on a
         // phone; create it now rather than failing on the first tool call.
         if (projectDir) await fs.mkdir(projectDir, { recursive: true });
-        const session = store.newSession({ name, model, projectDir, system, mode });
+        const session = store.newSession({ name, model, projectDir, system, mode, appId: appId ?? null });
         await store.save(session);
         return json(res, 200, session);
       }
@@ -741,6 +872,9 @@ const server = http.createServer(async (req, res) => {
           .stat(session.projectDir)
           .then((st) => st.isDirectory())
           .catch(() => false));
+        // Rooted at home means every project on the machine is in scope, which
+        // is never what was wanted and is worth surfacing rather than inferring.
+        session.projectDirIsHome = path.resolve(session.projectDir) === path.resolve(os.homedir());
         return json(res, 200, session);
       }
       if (req.method === 'DELETE' && id) {
@@ -752,6 +886,8 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'PATCH' && id) {
         const session = live.get(id) ?? (await store.load(id, { repair: !running.has(id) }));
         const patch = await readBody(req);
+        const badDir = refuseAsProjectDir(patch.projectDir);
+        if (badDir) return json(res, 400, { error: badDir });
         if (patch.projectDir) await fs.mkdir(patch.projectDir, { recursive: true });
 
         // Record a switch in the transcript. Without this there is no evidence
@@ -868,6 +1004,7 @@ const server = http.createServer(async (req, res) => {
         const controller = new AbortController();
         const turn = { controller, startedAt: Date.now(), last: null };
         running.set(id, turn);
+        beacons.start(id, { model: session.model });
         json(res, 200, { ok: true }); // answer now; the work streams over SSE
 
         runTurn({
@@ -878,6 +1015,7 @@ const server = http.createServer(async (req, res) => {
           signal: controller.signal,
           save: (s) => store.save(s),
           monitorsFile: monitorsPath(USER_DATA),
+          tailnetHost: await apps.tailnetHost().catch(() => null),
           // A ready-to-run command for the monitor companion, so a custom view
           // can reuse the server's own process discovery instead of redoing it.
           activityCmd: `curl -s "http://127.0.0.1:${PORT}/api/activity?session=${
@@ -885,6 +1023,8 @@ const server = http.createServer(async (req, res) => {
           }&raw=1&t=$(cat ${JSON.stringify(path.join(USER_DATA, 'server-token'))})"`,
           onEvent: (event) => broadcast(id, { kind: 'event', event }),
           onDelta: (delta) => {
+            // Any sign of life counts: a token, a tool starting, a tool ending.
+            beacons.touch(id, delta.kind === 'tool_start' ? `${delta.call?.name} ${describeArg(delta.call)}` : delta.kind);
             if (delta.kind === 'tool_start') turn.last = delta.call?.name ?? null;
             if (delta.kind === 'rate_limit') {
               providerLimits.set(session.model, { info: delta.info, at: Date.now() });
@@ -899,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
           .catch((e) => broadcast(id, { kind: 'error', error: e?.message ?? String(e) }))
           .finally(async () => {
             running.delete(id);
+            beacons.stop(id);
             live.delete(id);
 
             // Commit whatever the turn changed on disk. Failures are reported
@@ -1002,6 +1143,86 @@ TOKEN = await resolveToken(USER_DATA);
 usage = await usageStore.load(USER_DATA);
 await collectUsage({ force: true });      // catch up on anything missed while down
 setInterval(() => collectUsage().catch(() => {}), 60_000).unref();
+
+/**
+ * The wedge watcher.
+ *
+ * Runs on a plain timer in the server, deliberately outside any model: a turn
+ * that has stopped progressing is exactly the thing that cannot report itself.
+ * When a beacon goes stale the user is told through whatever channel they have
+ * configured, and by email if that is set up, because the whole point is that
+ * they are not at the laptop watching.
+ */
+async function checkForStalls() {
+  const stallMs = Number(process.env.HARNESS_STALL_MS ?? DEFAULT_STALL_MS);
+  const due = beacons.due({ stallMs });
+  for (const stall of due) {
+    const session = live.get(stall.sessionId);
+    const text = wedgeMessage({
+      sessionName: session?.name ?? stall.sessionId,
+      model: stall.model,
+      silentMs: stall.silentMs,
+      lastActivity: stall.lastActivity,
+    });
+
+    // Into the transcript first: the evidence must survive even if every
+    // outbound channel fails.
+    if (session) {
+      const note = noteEvent(`stalled — ${text}`);
+      session.events.push(note);
+      broadcast(stall.sessionId, { kind: 'event', event: note });
+      await store.save(session).catch(() => {});
+    }
+
+    const cfg = await loadNotify(USER_DATA).catch(() => null);
+    if (cfg?.enabled) await sendNotify(cfg, text).catch(() => {});
+    const email = await loadEmailConfig(USER_DATA).catch(() => null);
+    if (email?.apiKey && email?.to) {
+      await sendEmail(email, { subject: 'A harness turn has stalled', text, session: stall.sessionId }).catch(() => {});
+    }
+  }
+}
+setInterval(() => { checkForStalls().catch(() => {}); }, 30_000).unref();
+
+/**
+ * A turn that was running when the harness stopped used to vanish without a
+ * trace: the transcript simply ended on a tool result, which reads as "it
+ * finished and said nothing" rather than "this was cut off". That is the worst
+ * kind of failure — one with nowhere to look. A shutdown now aborts the turns
+ * it is interrupting and writes the interruption into each transcript before
+ * the process goes away, so the evidence outlives the server.
+ */
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  const interrupted = [...running.entries()];
+  for (const [id, turn] of interrupted) {
+    turn.controller?.abort();
+    const session = live.get(id);
+    if (!session) continue;
+    const note = noteEvent(
+      `turn interrupted — the harness stopped (${signal}) while this was running. `
+      + 'Work it had started in the background may have carried on regardless, so check the '
+      + 'project directory before assuming nothing happened. Send another message to continue.',
+    );
+    session.events.push(note);
+    broadcast(id, { kind: 'event', event: note });
+    // Best effort: the process is going away either way, and a failed save
+    // must not stop the other sessions from getting their note.
+    try { await store.save(session); } catch { /* nothing better to do here */ }
+  }
+
+  if (usage) await usageStore.save(USER_DATA, usage).catch(() => {});
+  server.close();
+  // Long enough for those notes to reach a phone that is still listening.
+  if (interrupted.length) await new Promise((r) => { setTimeout(r, 250); });
+  process.exit(0);
+}
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => { shutdown(sig).catch(() => process.exit(1)); });
+}
 
 server.listen(PORT, '0.0.0.0', () => {
   const host = `http://${lanAddress()}:${PORT}`;

@@ -14,6 +14,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import { renderForPrompt } from '../transcript.js';
 
@@ -34,9 +37,130 @@ function childEnv() {
   return env;
 }
 
+/**
+ * Codex's plan usage, which the `--json` stream does not carry.
+ *
+ * `codex exec --json` reports token counts but never a rate-limit figure, so
+ * this card used to say the CLI does not publish one. It does: every turn
+ * appends an `event_msg`/`token_count` line carrying a `rate_limits` object to
+ * that thread's rollout file, under
+ * `$CODEX_HOME/sessions/<local date>/rollout-<local time>-<thread id>.jsonl`.
+ * The figure is therefore read back from disk once the turn is done and
+ * translated into the shape `claude-cli` emits, which is what the usage card
+ * already knows how to draw.
+ */
+const WINDOW_NAMES = new Map([[300, 'five_hour'], [10080, 'seven_day'], [43200, 'month']]);
+
+function windowName(minutes) {
+  if (WINDOW_NAMES.has(minutes)) return WINDOW_NAMES.get(minutes);
+  if (!minutes) return 'window';
+  if (minutes % 1440 === 0) return `last ${minutes / 1440} days`;
+  if (minutes % 60 === 0) return `last ${minutes / 60} hours`;
+  return `last ${minutes} minutes`;
+}
+
+function dayDir(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return path.join(String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate()));
+}
+
+/** The rollout file Codex wrote for this thread, if it can be found. */
+export async function findRollout(threadId, { home, now = Date.now() } = {}) {
+  if (!threadId) return null;
+  const root = path.join(home ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'sessions');
+  // Those names use local time, so a turn begun before midnight is filed under
+  // yesterday. Checking both costs one failed readdir.
+  for (const ms of [now, now - 86_400_000]) {
+    const dir = path.join(root, dayDir(new Date(ms)));
+    let names;
+    try { names = await fs.readdir(dir); } catch { continue; }
+    const hit = names.find((n) => n.endsWith('.jsonl') && n.includes(threadId));
+    if (hit) return path.join(dir, hit);
+  }
+  return null;
+}
+
+/** The newest `rate_limits` recorded in a rollout file, or null. */
+export async function readRateLimits(file) {
+  let text;
+  try {
+    const { size } = await fs.stat(file);
+    // The line wanted is the last one; a long session's rollout is not worth
+    // reading whole.
+    const TAIL = 512 * 1024;
+    if (size > TAIL) {
+      const fh = await fs.open(file, 'r');
+      try {
+        const buf = Buffer.alloc(TAIL);
+        await fh.read(buf, 0, TAIL, size - TAIL);
+        text = buf.toString('utf8');
+      } finally { await fh.close(); }
+    } else {
+      text = await fs.readFile(file, 'utf8');
+    }
+  } catch { return null; }
+
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"rate_limits"')) continue;
+    // A tail read can slice the first line in half; that parse simply fails.
+    try {
+      const rl = JSON.parse(lines[i])?.payload?.rate_limits;
+      if (rl) return rl;
+    } catch { /* keep looking backwards */ }
+  }
+  return null;
+}
+
+/**
+ * The most recent report Codex left behind, from any thread.
+ *
+ * Plan usage is an account-wide figure, not a per-session one, so the newest
+ * rollout on disk is as true as one written by this harness. Reading it means
+ * the card is right the moment it is opened rather than only after an Astra
+ * turn happens to run.
+ */
+export async function latestRateLimits({ home, now = Date.now() } = {}) {
+  const root = path.join(home ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'sessions');
+  for (const ms of [now, now - 86_400_000]) {
+    const dir = path.join(root, dayDir(new Date(ms)));
+    let names;
+    try { names = await fs.readdir(dir); } catch { continue; }
+    // Those names begin with a sortable local timestamp, so newest is last.
+    const files = names.filter((n) => n.endsWith('.jsonl')).sort().reverse();
+    for (const n of files) {
+      const rl = await readRateLimits(path.join(dir, n));
+      const u = toUnified(rl);
+      if (u) return u;
+    }
+  }
+  return null;
+}
+
+/** Codex's report, in the shape `normalizeProviderLimits` already understands. */
+export function toUnified(rl) {
+  if (!rl) return null;
+  const unifiedWindows = {};
+  for (const w of [rl.primary, rl.secondary]) {
+    if (!w || typeof w.used_percent !== 'number') continue;
+    unifiedWindows[windowName(w.window_minutes)] = {
+      // Codex says 7.0 for seven percent; the card wants a fraction.
+      utilization: w.used_percent / 100,
+      // Seconds, like Claude's — the normaliser scales it to milliseconds.
+      resetsAt: w.resets_at ?? null,
+    };
+  }
+  if (!Object.keys(unifiedWindows).length) return null;
+  return {
+    status: rl.plan_type ?? null,
+    rateLimitType: rl.rate_limit_reached_type ?? null,
+    unifiedWindows,
+  };
+}
+
 export async function complete({
   client, spec, events, system, onText, onThinking, onToolStart, onToolEnd, onStep,
-  signal, cwd,
+  onRateLimit, signal, cwd,
 }) {
   const reply = {
     model: spec.alias,
@@ -176,6 +300,18 @@ export async function complete({
 
   signal?.removeEventListener('abort', abort);
   if (buf.trim()) handle(buf);
+
+  // Plan usage arrives on disk rather than down the pipe; the rollout file is
+  // complete by the time the process is. A failure here is not the turn's
+  // failure, so it only costs the percentage on the card.
+  if (reply.threadId) {
+    const file = await findRollout(reply.threadId);
+    const info = file ? toUnified(await readRateLimits(file)) : null;
+    if (info) {
+      reply.rateLimit = info;
+      onRateLimit?.(info);
+    }
+  }
 
   reply.usage.ms = Date.now() - started;
   if (code !== 0 && !reply.error) {

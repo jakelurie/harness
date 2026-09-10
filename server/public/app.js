@@ -176,6 +176,73 @@ function describe(call) {
 }
 
 /**
+ * The plain text behind each reply, so it can be copied out and pasted into
+ * another session as context.
+ *
+ * Kept in a map rather than a data- attribute because `esc` above deliberately
+ * leaves quotes alone, and a reply containing one would break out of the
+ * attribute. The map is rebuilt with the transcript, so it cannot drift from
+ * what is on screen or grow without bound.
+ */
+const copyTexts = new Map();
+
+/**
+ * Copy text, on a phone, over both of the ways this harness is reached.
+ *
+ * The async clipboard API exists only in a secure context. Over Tailscale that
+ * is HTTPS and it works; over plain HTTP on the LAN `navigator.clipboard` is
+ * simply undefined, so the old selection trick is kept as the path for that
+ * rather than letting the button do nothing. iOS ignores a readonly textarea,
+ * hence the contentEditable range dance.
+ */
+async function copyText(text) {
+  // Neither route can write to the clipboard while the document is unfocused,
+  // and `execCommand` will still cheerfully return true when it wrote nothing.
+  // Checking first is what keeps the button from claiming a copy that did not
+  // happen - a button that lies is worse than one that says it could not.
+  if (!document.hasFocus()) {
+    window.focus();
+    if (!document.hasFocus()) return false;
+  }
+
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch { /* denied or unavailable - fall through */ }
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.contentEditable = 'true';
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+  document.body.appendChild(ta);
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(ta);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ta.setSelectionRange(0, text.length);
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    ta.remove();
+  }
+}
+
+/** Last resort: put the reply under a selection so it can be copied by hand. */
+function selectReply(button) {
+  const body = button.closest('.turn.assistant')?.querySelector('.body');
+  if (!body) return;
+  const range = document.createRange();
+  range.selectNodeContents(body);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/**
  * A turn is what a person actually thinks in: something I asked, some work, an
  * answer. The event log is flatter than that - assistant, tool_result,
  * assistant, tool_result - so it gets regrouped here.
@@ -184,7 +251,7 @@ function turnsFrom(events) {
   const turns = [];
   let cur = null;
   const start = (user) => {
-    cur = { user, steps: [], texts: [], notes: [], files: [], model: null };
+    cur = { user, steps: [], texts: [], notes: [], files: [], model: null, endedOn: null };
     turns.push(cur);
     return cur;
   };
@@ -195,12 +262,13 @@ function turnsFrom(events) {
 
     if (e.type === 'assistant') {
       cur.model = e.model || cur.model;
-      if (e.text?.trim()) cur.texts.push(e);
+      if (e.text?.trim()) { cur.texts.push(e); cur.endedOn = 'reply'; }
       for (const c of e.toolCalls ?? []) cur.steps.push({ call: c, result: null });
     } else if (e.type === 'tool_result') {
       const step = cur.steps.find((x) => x.call.id === e.callId && !x.result);
       if (step) step.result = e;
       else cur.steps.push({ call: { id: e.callId, name: e.name, args: {} }, result: e });
+      cur.endedOn = 'tool';
     } else if (e.type === 'note') {
       cur.notes.push(e);
     } else if (e.type === 'files') {
@@ -309,16 +377,23 @@ function foldSummary(turn, running) {
   const endedBadly = !running && last?.result && !last.result.ok;
   const silent = !running && steps > 0 && !turn.texts.length;
 
-  const tone = endedBadly ? 'bad' : (failures || silent) ? 'warn' : 'ok';
+  // A turn that stopped straight after a tool, with no closing message, is the
+  // case that reads as "still going" when it is not. Name it.
+  const stoppedShort = !running && turn.endedOn === 'tool';
+
+  const tone = endedBadly ? 'bad' : (failures || silent || stoppedShort) ? 'warn' : 'ok';
   const parts = [];
-  if (running) parts.push(`working${last?.call?.name ? ` · ${esc(last.call.name)}` : ''}`);
-  else if (endedBadly) parts.push(`stopped on ${esc(last.call.name)}`);
-  else {
+  if (running) {
+    parts.push(`working${last?.call?.name ? ` · ${esc(last.call.name)}` : ''}`);
+  } else if (endedBadly) {
+    parts.push(`stopped on ${esc(last.call.name)}`);
+  } else {
+    // "done" first, so the state is the first thing read rather than inferred.
+    parts.push(stoppedShort ? 'ended without a summary' : 'done');
     if (turn.texts.length) parts.push(`${turn.texts.length} repl${turn.texts.length === 1 ? 'y' : 'ies'}`);
     if (steps) parts.push(`${done} step${done === 1 ? '' : 's'}`);
     if (failures) parts.push(`${failures} recovered`);
-    if (silent) parts.push('no summary');
-    if (!parts.length) parts.push('no output');
+    if (silent) parts.push('output below');
   }
   // A turn that produced nothing at all is not a green outcome.
   const empty = !running && !turn.texts.length && !turn.steps.length;
@@ -343,8 +418,13 @@ function turnHtml(turn, i, running, number, isLast) {
         <span class="at">${clock(turn.user.ts)}</span></div>
       <div class="bubble">${esc(turn.user.text)}${
   (turn.user.attachments ?? []).length
-    ? `<div class="shots">${turn.user.attachments.map((a) =>
-      `<img src="/api/file?path=${encodeURIComponent(a.path)}" alt="${esc(a.name)}">`).join('')}</div>`
+    ? `<div class="shots">${turn.user.attachments.map((a) => (a.role === 'document'
+      ? `<button class="file-card sent-doc" data-open-file="${esc(a.path)}" data-file-kind="${a.mime === 'application/pdf' ? 'pdf' : 'text'}">
+           <span class="file-icon">${a.mime === 'application/pdf' ? '📕' : '📄'}</span>
+           <span class="file-meta"><span class="file-name">${esc(a.name)}</span>
+           <span class="file-sub">${humanSize(a.bytes ?? 0)}</span></span>
+         </button>`
+      : `<img src="/api/file?path=${encodeURIComponent(a.path)}" alt="${esc(a.name)}">`)).join('')}</div>`
     : ''}</div>
       ${cost.length ? `<div class="usage turn-cost">${cost.join(' · ')}</div>` : ''}</div>`);
   }
@@ -352,13 +432,19 @@ function turnHtml(turn, i, running, number, isLast) {
   // Everything the question caused - what was said back and what was run -
   // lives inside one fold, with the step list as a further fold inside it.
   const inner = [];
-  for (const a of turn.texts) {
+  for (const [j, a] of turn.texts.entries()) {
     const think = a.thinking ? `<div class="thinking">${esc(a.thinking)}</div>` : '';
+    // The markdown source, not the rendered text: code fences and list markers
+    // are exactly what makes it worth pasting somewhere else.
+    const copyId = `${key}-${j}`;
+    copyTexts.set(copyId, a.text);
     inner.push(`<div class="turn assistant">
       <div class="who"><span class="tag">${esc(a.model)}</span>
         ${a.servedModel && a.servedModel !== a.model
           ? `<span class="served">${esc(a.servedModel)}</span>` : ''}
-        <span class="at">${clock(a.ts)}</span></div>
+        <span class="at">${clock(a.ts)}</span>
+        <button class="copy-reply" data-copy="${esc(copyId)}"
+          aria-label="Copy this reply as plain text">copy</button></div>
       ${think}<div class="body">${render(a.text)}</div></div>`);
   }
   inner.push(activityChip(turn, key, running));
@@ -407,7 +493,7 @@ function drawTranscript() {
   const s = cur().session;
   const el = $('transcript');
   if (!s) {
-    el.innerHTML = '<div class="empty"><p>no session open</p><p class="dim">tap ☰ to start one</p></div>';
+    el.innerHTML = '<div class="empty"><p>no session open</p><p class="dim">tap ☰ for sessions · 🚀 for apps</p></div>';
     return;
   }
   if (!s.events.length) {
@@ -419,6 +505,7 @@ function drawTranscript() {
     return;
   }
   const turns = turnsFrom(s.events);
+  copyTexts.clear();
   let n = 0;
   el.innerHTML = turns
     .map((t, i) => turnHtml(
@@ -532,7 +619,9 @@ function paintHeader() {
   $('send').disabled = !t.session;
   $('input').placeholder = idlePlaceholder();
   const model = s && state.models[s.model];
-  if (s?.projectDirMissing) {
+  if (s && s.projectDir === state.home) {
+    showBanner('this session is rooted at your home folder — every project is in its scope. Tap 🔧 to give it its own directory.', true);
+  } else if (s?.projectDirMissing) {
     showBanner(`${shortDir(s.projectDir)} no longer exists — tap ⚙ to point this session somewhere else`, true);
   } else if (s && model && !model.hasKey) {
     showBanner(`${s.model} has no API key — tap ⚙ to add one`, true);
@@ -795,8 +884,20 @@ async function sessionsSheet() {
 let draft = {};   // survives a detour through the directory browser
 
 async function newSheet() {
-  const dir = draft.dir ?? state.session?.projectDir ?? state.home;
+  // Each session gets its own folder. Inheriting the previous session's meant
+  // one session started at ~ and every later one did too, so every project on
+  // the machine was in scope for all of them.
+  const dir = draft.dir ?? '';
+  // An app owns its directory. Attaching a session to one is the normal case:
+  // several sessions on one app, each free to run a different model.
+  let appList = [];
+  try { appList = (await api('/api/apps')).apps; } catch { /* apps are optional */ }
   openSheet(`<h2>New session</h2>
+    <label>App</label>
+    <select id="n-app">
+      <option value="">— no app, just a folder —</option>
+      ${appList.map((a) => `<option value="${esc(a.id)}"${draft.appId === a.id ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}
+    </select>
     <label>Name</label><input id="n-name" placeholder="what you're building" />
     <label>Model</label><select id="n-model">${modelOptions(state.default)}</select>
     <label>Mode</label>
@@ -804,8 +905,8 @@ async function newSheet() {
       <option value="agent">agent — tools, works in a project folder</option>
       <option value="chat">chat — plain Q&amp;A, no tools</option>
     </select>
-    <label>Project directory</label>
-    <div class="row"><input id="n-dir" value="${esc(dir)}" spellcheck="false" />
+    <label>Project directory — its own folder, created if new</label>
+    <div class="row"><input id="n-dir" value="${esc(dir)}" placeholder="~/Projects/…" spellcheck="false" />
     <button class="ghost" id="n-browse" style="flex:0 0 92px">browse</button></div>
     <label>Extra instructions (optional)</label><textarea id="n-sys"></textarea>
     <div class="actions"><button class="ghost" id="n-cancel">cancel</button>
@@ -824,19 +925,52 @@ async function newSheet() {
     };
   };
 
+  // Suggest a folder from the name, and stop as soon as the user edits it.
+  let dirTouched = Boolean(draft.dir);
+  const slug = (t) => t.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const suggest = () => {
+    if (dirTouched) return;
+    const name = slug($('n-name').value) || 'session';
+    $('n-dir').value = `${state.home}/Projects/${name}`;
+  };
+  $('n-name').addEventListener('input', suggest);
+  $('n-dir').addEventListener('input', () => { dirTouched = true; });
+  suggest();
+
+  // The app's directory wins, and the field goes read-only so the two cannot
+  // disagree about where the session is working.
+  const applyApp = () => {
+    const app = appList.find((a) => a.id === $('n-app').value);
+    if (app) {
+      $('n-dir').value = app.dir;
+      $('n-dir').disabled = true;
+      dirTouched = true;
+    } else {
+      $('n-dir').disabled = false;
+    }
+  };
+  $('n-app').addEventListener('change', applyApp);
+  applyApp();
+
   $('n-cancel').onclick = () => { draft = {}; sessionsSheet(); };
   $('n-browse').onclick = () => {
     keep();
     browseSheet($('n-dir').value, (chosen) => { draft.dir = chosen; newSheet(); });
   };
   $('n-go').onclick = async () => {
+    const chosen = $('n-dir').value.trim().replace(/\/+$/, '');
+    if (!chosen && !$('n-app').value) return showBanner('give this session a folder of its own');
+    if (chosen === state.home.replace(/\/+$/, '')) {
+      return showBanner('that is your home folder — give the session its own directory, or everything on the machine is in scope');
+    }
     const session = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({
+        appId: $('n-app').value || null,
         name: $('n-name').value.trim() || 'untitled',
         model: $('n-model').value,
         mode: $('n-mode').value,
-        projectDir: $('n-dir').value.trim(),
+        projectDir: chosen,
         system: $('n-sys').value,
       }),
     });
@@ -953,8 +1087,12 @@ async function settingsSheet() {
     <h3>Notify me when a turn finishes</h3>
     <div id="s-notify"><p class="dim">loading…</p></div>
 
+    <h3>Email</h3>
+    <p class="dim">Any session can email you with <span class="mono">send_email</span> — useful when a long run finishes and you are not watching.</p>
+    <div id="s-email"><p class="dim">loading…</p></div>
+
     <h3>Configure a model</h3>
-    <p class="dim">Keys and endpoints — this does not switch anything.</p>${rows}
+    <p class="dim">Keys and endpoints — this edits what a model <em>is</em>, for every session. It does not switch this session's model; use the list above for that.</p>${rows}
     <div class="actions"><button class="primary" id="s-close">done</button></div>`);
 
   $('s-close').onclick = closeSheet;
@@ -990,6 +1128,7 @@ async function settingsSheet() {
     };
   }
   if ($('s-notify')) paintNotify();
+  if ($('s-email')) paintEmail();
   if ($('s-git')) paintGit(session);
   $('sheet').querySelectorAll('[data-band]').forEach((el) => {
     el.onclick = async () => {
@@ -1051,6 +1190,42 @@ async function setSessionModel(alias) {
   if (state.tab === 'chat') state.session = updated;
   drawTranscript();
   paintHeader();
+}
+
+/** Outbound email — one harness-wide setting, used by every session's send_email tool. */
+async function paintEmail() {
+  const box = $('s-email');
+  if (!box) return;
+  let e;
+  try { e = await api('/api/email'); } catch (err) { box.innerHTML = `<p class="dim">${esc(err.message)}</p>`; return; }
+
+  box.innerHTML = `
+    <label>Send to</label>
+    <input id="em-to" value="${esc(e.to ?? '')}" placeholder="you@example.com" inputmode="email" spellcheck="false" />
+    <label>Resend API key ${e.hasKey ? '<span class="pill ready">saved</span>' : '<span class="pill missing">none</span>'}</label>
+    <input id="em-key" value="" placeholder="${e.hasKey ? 'saved — type to replace' : 're_...'}" spellcheck="false" />
+    <div class="actions">
+      <button class="ghost" id="em-save">save</button>
+      <button class="ghost" id="em-test"${e.hasKey && e.to ? '' : ' disabled'}>send test</button>
+    </div>
+    <p class="dim" id="em-msg"></p>`;
+
+  $('em-save').onclick = async () => {
+    const body = { to: $('em-to').value.trim() };
+    // An empty box means "leave it alone", not "erase the key".
+    const key = $('em-key').value.trim();
+    if (key) body.apiKey = key;
+    $('em-msg').textContent = 'saving…';
+    try { await api('/api/email', { method: 'POST', body: JSON.stringify(body) }); paintEmail(); }
+    catch (err) { $('em-msg').textContent = err.message; }
+  };
+  $('em-test').onclick = async () => {
+    $('em-msg').textContent = 'sending…';
+    try {
+      const r = await api('/api/email/test', { method: 'POST' });
+      $('em-msg').textContent = `sent to ${r.to}`;
+    } catch (err) { $('em-msg').textContent = err.message; }
+  };
 }
 
 /** Notification settings — global, not per session. */
@@ -1527,6 +1702,151 @@ function bar(pct, tone = '') {
 
 let usageWindow = 'seven_day';
 
+
+/**
+ * Apps: the durable things. A session comes and goes; an app has a directory, a
+ * repository, a port and two addresses, and is still here after a reboot.
+ *
+ * Both addresses are always shown together. The harness's tailscaled runs with
+ * userspace networking, so the laptop cannot resolve its own .ts.net name —
+ * showing only the tailnet link leaves you unable to open your own app on the
+ * machine running it.
+ */
+async function appsSheet() {
+  let d;
+  try { d = await api('/api/apps'); }
+  catch (e) { return openSheet(`<h2>Apps</h2><p class="dim">${esc(e.message)}</p>`); }
+
+  await refreshState();
+  const sessionsFor = (id) => state.sessions.filter((x) => x.appId === id);
+
+  const rows = d.apps.length ? d.apps.map((a) => {
+    const mine = sessionsFor(a.id);
+    return `<div class="item app-card">
+      <div class="grow">
+        <div class="t">${esc(a.name)}
+          <span class="pill ${a.running ? 'ready' : ''}">${a.running ? 'running' : 'stopped'}</span></div>
+        <div class="s">${esc(shortDir(a.dir))}${a.repo ? ` · ${esc(a.repo)}` : ''}</div>
+        ${a.running ? `<div class="s app-links">
+            <a href="${esc(a.urls.phone ?? '#')}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone ?? 'tailscale down')}</a><br>
+            <a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>
+          </div>` : `<div class="s dim">port ${a.port} · publishes on ${a.servePort}</div>`}
+        <div class="s dim">${mine.length} session${mine.length === 1 ? '' : 's'}${
+  mine.length ? `: ${mine.map((x) => esc(`${x.name} (${x.model})`)).join(', ')}` : ''}</div>
+      </div>
+      <div class="app-actions">
+        <button class="x" data-app-run="${esc(a.id)}">${a.running ? '■' : '▶'}</button>
+        <button class="x" data-app-edit="${esc(a.id)}">✎</button>
+        <button class="x" data-app-log="${esc(a.id)}">▤</button>
+      </div>
+    </div>`;
+  }).join('') : '<p class="dim">no apps yet — an app is a project you can launch and open</p>';
+
+  openSheet(`<h2>Apps</h2>${rows}
+    <div class="actions"><button class="primary" id="app-new">new app</button></div>`);
+
+  $('app-new').onclick = () => appEditSheet(null);
+  $('sheet').querySelectorAll('[data-app-edit]').forEach((el) => {
+    el.onclick = () => appEditSheet(d.apps.find((a) => a.id === el.dataset.appEdit));
+  });
+  $('sheet').querySelectorAll('[data-app-log]').forEach((el) => {
+    el.onclick = async () => {
+      const text = await (await fetch(`/api/apps/${el.dataset.appLog}/log`)).text();
+      openSheet(`<h2>Log</h2><pre class="log">${esc(text.slice(-8000) || '(empty)')}</pre>
+        <div class="actions"><button class="ghost" id="back">back</button></div>`);
+      $('back').onclick = appsSheet;
+    };
+  });
+  $('sheet').querySelectorAll('[data-app-run]').forEach((el) => {
+    el.onclick = async () => {
+      const app = d.apps.find((a) => a.id === el.dataset.appRun);
+      el.disabled = true;
+      el.textContent = '…';
+      try {
+        const r = await api(`/api/apps/${app.id}/${app.running ? 'stop' : 'start'}`, { method: 'POST' });
+        // Fail closed: a stop that cannot be confirmed says so rather than
+        // redrawing as though it worked.
+        if (r.unconfirmed) showBanner(`${app.name} did not confirm it stopped — something is still holding port ${app.port}`, true);
+        else if (r.served === false) showBanner(`${app.name} is up locally, but Tailscale would not publish it`, true);
+      } catch (e) { showBanner(e.message, true); }
+      appsSheet();
+    };
+  });
+}
+
+/** Create or edit an app. The directory is the app's, and sessions inherit it. */
+/**
+ * Create or edit an app.
+ *
+ * `app` is the saved record, or null when creating; `draft` carries values
+ * across a trip through the folder browser. Those are kept apart deliberately:
+ * the browser used to hand back a plain object with no id, which made the save
+ * think it was editing and PATCH `/api/apps/undefined` — so opening the browser
+ * at all, even to cancel, broke creating an app with "no such app".
+ */
+function appEditSheet(app = null, draft = null) {
+  const existing = Boolean(app?.id);
+  const a = draft ?? app ?? { name: '', dir: '', start: '', repo: '' };
+
+  openSheet(`<h2>${existing ? 'Edit app' : 'New app'}</h2>
+    <label>Name</label><input id="ap-name" value="${esc(a.name ?? '')}" spellcheck="false" placeholder="what you're building" />
+    <label>Folder${existing ? '' : ' — made for you from the name'}</label>
+    <div class="row"><input id="ap-dir" value="${esc(a.dir ?? '')}" spellcheck="false" ${existing ? 'disabled' : ''} />
+      ${existing ? '' : '<button class="ghost" id="ap-browse" style="flex:0 0 80px">browse</button>'}</div>
+    <label>Start command</label>
+    <input id="ap-start" value="${esc(a.start ?? '')}" spellcheck="false" placeholder="npm run dev" />
+    <p class="dim">Runs in the app's folder with <span class="mono">PORT</span> set${existing ? ` to ${app.port}` : ' to the port this app is given'}.</p>
+    <label>Repository (optional)</label>
+    <input id="ap-repo" value="${esc(a.repo ?? '')}" spellcheck="false" placeholder="git@github.com:you/app.git" />
+    <div class="actions">
+      <button class="primary" id="ap-save">${existing ? 'save' : 'create app'}</button>
+      <button class="ghost" id="ap-back">back</button>
+      ${existing ? '<button class="ghost" id="ap-del">delete</button>' : ''}
+    </div>`);
+
+  const values = () => ({
+    name: $('ap-name').value, dir: $('ap-dir').value,
+    start: $('ap-start').value, repo: $('ap-repo').value,
+  });
+
+  // Every app gets its own folder under ~/Projects without the user typing a
+  // path. Typing in the field yourself stops the suggestion taking over.
+  if (!existing) {
+    let touched = Boolean(a.dir);
+    const slugify = (t) => t.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const suggest = () => {
+      if (touched) return;
+      const name = slugify($('ap-name').value);
+      $('ap-dir').value = name ? `${state.home}/Projects/${name}` : '';
+    };
+    $('ap-name').addEventListener('input', suggest);
+    $('ap-dir').addEventListener('input', () => { touched = true; });
+    suggest();
+    $('ap-browse').onclick = () => browseSheet($('ap-dir').value || `${state.home}/Projects`,
+      (chosen) => appEditSheet(app, { ...values(), dir: chosen }),
+      () => appEditSheet(app, values()));
+  }
+
+  $('ap-back').onclick = appsSheet;
+  if ($('ap-del')) {
+    $('ap-del').onclick = async () => {
+      // Sessions are not deleted with the app; they just come unattached.
+      await api(`/api/apps/${app.id}`, { method: 'DELETE' });
+      appsSheet();
+    };
+  }
+  $('ap-save').onclick = async () => {
+    const v = values();
+    const body = { name: v.name.trim(), start: v.start.trim(), repo: v.repo.trim() || null };
+    if (!body.name && !existing) return showBanner('give the app a name');
+    try {
+      if (existing) await api(`/api/apps/${app.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      else await api('/api/apps', { method: 'POST', body: JSON.stringify({ ...body, dir: v.dir.trim() }) });
+      appsSheet();
+    } catch (e) { showBanner(e.message, true); }
+  };
+}
+
 async function usageSheet() {
   let d;
   try {
@@ -1541,11 +1861,11 @@ async function usageSheet() {
   /**
    * One card per model, all the same weight.
    *
-   * Only some backends report a limit. Claude Code sends real window
-   * utilisation; the Codex CLI reports token counts but no rate-limit figure at
-   * all, and a metered API has no ceiling to show. Rather than inventing a
-   * percentage for the ones that do not publish one, each card says what is
-   * actually known about it.
+   * Only some backends report a limit. Both subscription CLIs send real
+   * window utilisation — Claude Code down its stream, Codex via the rollout
+   * file its turn leaves behind — while a metered API has no ceiling to show.
+   * Rather than inventing a percentage for the ones that do not publish one,
+   * each card says what is actually known about it.
    */
   const card = (m) => {
     const p = d.provider?.[m.alias];
@@ -1560,10 +1880,7 @@ async function usageSheet() {
           ${bar(w.pct, w.pct > 0.9 ? 'hot' : w.pct > 0.7 ? 'warm' : '')}
           <div class="s">${esc(untilReset(w.resetsAt))}</div>
         </div>`).join('');
-    } else if (m.provider === 'codex-cli') {
-      limit = `<p class="s">Plan limits apply, but the Codex CLI does not report how much is left.
-        <a href="https://chatgpt.com/codex/settings/usage" target="_blank" rel="noopener">check on chatgpt.com</a></p>`;
-    } else if (m.provider === 'claude-cli') {
+    } else if (m.provider === 'codex-cli' || m.provider === 'claude-cli') {
       limit = '<p class="s">Plan limits apply — the figure arrives with this model\'s next turn.</p>';
     } else if (m.limit) {
       limit = `<div class="meter">
@@ -1744,6 +2061,7 @@ function screenSheet() {
 
 $('screen').onclick = screenSheet;
 $('menu').onclick = sessionsSheet;
+$('appsbtn').onclick = appsSheet;
 $('gear').onclick = settingsSheet;
 function paintPending() {
   const box = $('pending');
@@ -1816,7 +2134,30 @@ $('transcript').addEventListener('scroll', () => {
 });
 
 // Tap the chip to see what actually ran; tap a step inside it for its output.
-$('transcript').addEventListener('click', (e) => {
+$('transcript').addEventListener('click', async (e) => {
+  const copy = e.target.closest('.copy-reply');
+  if (copy) {
+    // Inside the fold header's own click target, so stop it toggling the fold.
+    e.stopPropagation();
+    const text = copyTexts.get(copy.dataset.copy);
+    if (text == null) return;
+    const ok = await copyText(text);
+    // Say what happened. A copy button that silently failed is the sort of
+    // thing you only discover after pasting nothing into the other session.
+    // When it cannot copy, it selects the reply instead, so the fallback is
+    // one long-press away rather than a dead end.
+    if (!ok) selectReply(copy);
+    // Kept short: this sits in a header beside the model name on a phone.
+    copy.textContent = ok ? 'copied' : 'selected';
+    copy.title = ok ? '' : 'Clipboard unavailable here — long-press the highlighted text to copy';
+    copy.classList.toggle('failed', !ok);
+    setTimeout(() => {
+      copy.textContent = 'copy';
+      copy.classList.remove('failed');
+    }, ok ? 1200 : 3000);
+    return;
+  }
+
   const fold = e.target.closest('.fold');
   if (fold) {
     const key = fold.dataset.fold;

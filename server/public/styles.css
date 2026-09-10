@@ -500,6 +500,29 @@ body.tab-monitor.chat-open #transcript { flex: 2 1 0; min-height: 0; }
 .turn.assistant .body { white-space: normal; }
 
 .who .at { color: var(--fg-faint); font-weight: 400; margin-left: 6px; }
+
+/* Copy a reply out as plain text, for pasting into another session.
+   Sits at the far right of the reply's own header, quiet until it is wanted -
+   and a real 44px tap target, because this is used on a phone. */
+.turn.assistant .who { display: flex; align-items: center; }
+.copy-reply {
+  margin-left: auto;
+  min-height: 28px; padding: 4px 10px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  /* The button is small, so the touch area is grown past its box instead of
+     making the header taller. */
+  position: relative;
+}
+.copy-reply::after {
+  content: ''; position: absolute; inset: -8px -6px;
+}
+.copy-reply:active { background: var(--line); color: var(--fg); }
+.copy-reply.failed { color: var(--fg); border-color: var(--fg-faint); }
 .act .act-at { flex: 0 0 auto; color: var(--fg-faint); font-size: 11px; }
 
 .turn.user .turn-cost { margin-top: 5px; text-align: right; }
@@ -669,3 +692,17 @@ body.tab-monitor.chat-open #transcript { flex: 2 1 0; min-height: 0; }
 .usage-card { display: block; }
 .usage-card .meter { margin: 12px 0 2px; }
 .usage-card .s a { color: var(--accent); }
+
+.thumb.doc { display: flex; align-items: center; justify-content: center; background: var(--bg); }
+.thumb .doc-ext { font: 600 11px/1 var(--mono); color: var(--fg-dim); }
+.turn.user .shots .sent-doc { width: auto; max-width: 100%; }
+
+/* Apps: the durable half of the harness, listed separately from sessions. */
+.app-card { align-items: flex-start; }
+.app-card .app-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+.app-links a { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.app-links { margin: 4px 0; line-height: 1.6; }
+pre.log {
+  background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px; overflow-x: auto; font-size: 11px; max-height: 60vh;
+}

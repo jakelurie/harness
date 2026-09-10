@@ -10,9 +10,14 @@
  */
 
 import { exec } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+
+import { isProtected, sandboxProfile, HARNESS_ROOT, HARNESS_DATA } from './harness-guard.js';
+import { loadEmailConfig } from './email-config.js';
+import { sendEmail } from './email.js';
 
 const execAsync = promisify(exec);
 
@@ -63,6 +68,16 @@ function truncate(text) {
  */
 function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false) {
   const target = path.resolve(projectDir, p ?? '.');
+
+  // Absolute, and checked before `allowOutside`: no session setting may grant
+  // write access to the harness itself. Reading it stays allowed.
+  if (write && isProtected(target)) {
+    throw new Error(
+      `refused: ${p} is inside the harness itself (${HARNESS_ROOT}). Sessions run inside the harness `
+      + 'and cannot modify it. Work in your own project directory.',
+    );
+  }
+
   if (allowOutside) return target;
 
   const within = (root) => {
@@ -81,6 +96,22 @@ function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false
       'Grant the folder in the session settings, or turn off "confine to project directory".',
   );
 }
+
+/**
+ * Run a shell command under a profile that cannot write to the harness.
+ *
+ * Checking the command text would be theatre - a path can come from a
+ * variable, a symlink, or a program the command starts. This hands the rule to
+ * the kernel instead. If `sandbox-exec` is ever missing the command still runs:
+ * losing the shell entirely would be a worse failure than the one being
+ * guarded against, and the file tools enforce the same rule independently.
+ */
+function guarded(command) {
+  if (!existsSync('/usr/bin/sandbox-exec')) return command;
+  return `/usr/bin/sandbox-exec -p ${shellQuote(sandboxProfile())} /bin/sh -c ${shellQuote(command)}`;
+}
+
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 // ------------------------------------------------------------- definitions
 
@@ -178,7 +209,7 @@ export const TOOLS = [
     async run({ command }, ctx) {
       const PATH = await loginPath();
       try {
-        const { stdout, stderr } = await execAsync(command, {
+        const { stdout, stderr } = await execAsync(guarded(command), {
           cwd: ctx.projectDir,
           timeout: BASH_TIMEOUT_MS,
           maxBuffer: 8 * 1024 * 1024,
@@ -193,6 +224,29 @@ export const TOOLS = [
         if (e.killed) throw new Error(`command timed out after ${BASH_TIMEOUT_MS / 1000}s\n${parts}`);
         throw new Error(`exit code ${e.code ?? '?'}\n${parts}`);
       }
+    },
+  },
+  {
+    name: 'send_email',
+    description:
+      'Email the user. Use it when something needs their attention and they may not be watching: '
+      + 'a long run finished, a decision is needed, or work failed in a way you cannot resolve. '
+      + 'It goes to their own address; you cannot send anywhere else.',
+    schema: {
+      type: 'object',
+      properties: {
+        subject: { type: 'string', description: 'Subject line. Say the outcome, not "update".' },
+        body: { type: 'string', description: 'Plain text. Lead with what happened and what, if anything, is needed.' },
+      },
+      required: ['subject', 'body'],
+    },
+    async run({ subject, body }, ctx) {
+      // Loaded here rather than passed in: the credential never enters a
+      // session's context, so a session can send mail without being able to
+      // read the key or aim it somewhere else.
+      const cfg = await loadEmailConfig(HARNESS_DATA);
+      const sent = await sendEmail(cfg, { subject, text: body, session: ctx.sessionId });
+      return `sent to ${sent.to}${sent.id ? ` (${sent.id})` : ''}`;
     },
   },
 ];

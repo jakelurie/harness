@@ -9,3 +9,13 @@ secrets.json
 server-token
 models.json
 .env
+
+# TLS material fetched from Tailscale for local HTTPS. These are private keys
+# for this machine's own hostname and must never be committed.
+*.key
+*.crt
+*.pem
+
+# Python bytecode from the earlier CLI prototype.
+__pycache__/
+*.pyc

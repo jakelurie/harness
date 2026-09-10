@@ -42,12 +42,15 @@ function fileFor(id) {
   return path.join(sessionsDir, `${id}.json`);
 }
 
-export function newSession({ name, model, projectDir, system = '', mode = 'agent' }) {
+export function newSession({ name, model, projectDir, system = '', mode = 'agent', appId = null }) {
   return {
     id: `${stamp()}-${slug(name)}`,
     name: name || 'untitled',
     model,
     mode,
+    // Which app this session is working on. Several sessions attach to one app
+    // on purpose — that is how a model comparison is run.
+    appId,
     projectDir,
     system,
     confineToProjectDir: true,
@@ -140,6 +143,7 @@ export async function list() {
         id: s.id,
         name: s.name,
         model: s.model,
+        appId: s.appId ?? null,
         projectDir: s.projectDir,
         updatedAt: s.updatedAt,
         forkedFrom: s.forkedFrom,

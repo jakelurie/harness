@@ -7,7 +7,7 @@
  * with the whole history intact.
  */
 
-import { toDataUrl } from './attachments.js';
+import { toBase64, toDataUrl } from './attachments.js';
 import { clientFor, providerFor } from './providers/index.js';
 import { runTool } from './tools.js';
 import { assistantEvent, noteEvent, toolResultEvent, userEvent } from './transcript.js';
@@ -63,6 +63,17 @@ Working on the project:
 - Prefer edit_file over write_file when changing part of an existing file.
 - After making changes, verify them - run the tests, the build, or the program itself.
 - If a command fails, read the error and fix it rather than reporting the failure back verbatim.
+
+Serving an app the user can open from their phone:
+- The harness itself runs on port 8787 and owns its Tailscale hostname on ports 80, 443 and 8787. Never take those over, never point a tailscale serve rule at them, and never bind 8787. The user needs the harness reachable at all times, including while your app is running.
+- Give your app its own port and its own Tailscale entry, choosing a port nothing else is using. For example, to expose a server on port 4320:
+    tailscale --socket=$HOME/.tailscale-harness/tailscaled.sock serve --bg --https=8443 http://127.0.0.1:4320
+  Use that socket path: it is the tailscaled instance the harness runs under.
+- Tell the user BOTH addresses once it is up, and say which is which:
+    phone / away from home:  https://TAILNET_HOST:8443
+    the laptop itself:       http://127.0.0.1:4320
+  Both are needed. The harness's tailscaled runs with --tun=userspace-networking, which accepts connections from other devices on the tailnet but creates no network interface or DNS resolver on the laptop — so the laptop cannot resolve or reach a .ts.net name at all, and only the 127.0.0.1 address works there. Giving only the tailnet URL leaves the user unable to open their own app on the machine it is running on.
+- Leave the app running in the background so it stays reachable after your turn ends.
 - Do not narrate routine tool calls blow by blow, but always finish with the outcome.
 - End every turn with the state of things, in the past tense: what is now true, what you changed, and whether the user can use it. Do not end mid-stride with what you are "now doing" - your turn is over when you stop, so a message written as though work continues tells the user the opposite of the truth. If something is genuinely unfinished, say what remains and that you have stopped.`;
 
@@ -102,12 +113,15 @@ const CHAT_SYSTEM = `You are a helpful assistant talking with the user. Answer w
 /** A session in chat mode carries none of the agent scaffolding. */
 export const usesTools = (session) => session?.mode !== 'chat';
 
-export function systemPromptFor(session, monitorsFile, activityCmd) {
+export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost = null) {
   if (!usesTools(session)) {
     return session.system?.trim() ? `${CHAT_SYSTEM}\n\n${session.system.trim()}` : CHAT_SYSTEM;
   }
 
-  const parts = [BASE_SYSTEM, `\nProject directory: ${session.projectDir}`];
+  // The machine's own tailnet name is substituted here rather than written
+  // into the source: it is this user's infrastructure, not part of the tool.
+  const base = BASE_SYSTEM.replace(/TAILNET_HOST/g, tailnetHost ?? '<this machine>.ts.net');
+  const parts = [base, `\nProject directory: ${session.projectDir}`];
   if (monitorsFile) {
     // A monitor companion scopes its monitors to the session it watches, not
     // to itself, or its panels would show up in the wrong place.
@@ -124,8 +138,11 @@ export function systemPromptFor(session, monitorsFile, activityCmd) {
       parts.push(`\nIf you start long-running work the user should watch, redirect its output to a log file and add an entry to the monitors file at ${monitorsFile} (a JSON array; use {"id","label","kind":"file","path","session":"${scope}"}). Read that file first for the full set of monitor kinds.`);
     }
   }
+  parts.push('\nYou run inside a harness. The harness\'s own files are read-only to you: you may look at them, but any attempt to write there is refused, and that is deliberate rather than a fault to work around.');
+  parts.push('You can email the user with send_email when something needs them and they may not be watching — a long run finished, a decision is needed, or work failed in a way you cannot resolve. Do not email for routine progress.');
   if (session.confineToProjectDir) {
     parts.push('File tools are confined to this directory; paths outside it are refused.');
+    parts.push('This session is its own project. Other work on this machine is not yours to read or reason about, even if you can see it — do not go looking through other directories for context, and do not assume another project\'s files are related to this one. If you need something from elsewhere, ask.');
     if (session.readableDirs?.length) {
       parts.push(`You may also READ from these folders, but not write to them:\n${
         session.readableDirs.map((d) => `- ${d}`).join('\n')}`);
@@ -144,8 +161,78 @@ export function systemPromptFor(session, monitorsFile, activityCmd) {
  * @param onDelta  called with live streaming updates that are not persisted
  * @param save     persists the session; awaited after every appended event
  */
-export async function runTurn({
+/**
+ * The turn-end guard.
+ *
+ * The system prompt asks every session to finish in the past tense with what is
+ * now true. Asking is not enforcing: a turn that runs out of steps, or whose
+ * backend simply stops talking, ends on a tool result and reads as "finished,
+ * said nothing" — which is how a cut-off turn passes for a complete one. So the
+ * boundary is checked, and a turn that produced no closing words is given one
+ * bounded, tool-free call to write them.
+ *
+ * One call, never a loop: if the model cannot summarise its own work in a
+ * single pass, saying so plainly is better than spending the user's turn on it.
+ */
+export async function runTurn(opts) {
+  const before = opts.session.events.length;
+  await runTurnInner(opts);
+  try {
+    await closeOutTurn(opts, before);
+  } catch (e) {
+    // A missing summary is a blemish; a guard that throws would lose the turn.
+    opts.session.events.push(noteEvent(`turn-end guard: ${e?.message ?? e}`));
+    await opts.save(opts.session);
+  }
+}
+
+/** Did this turn end with the model actually saying something? */
+function endedWithWords(events, from) {
+  for (let i = events.length - 1; i >= from; i -= 1) {
+    const e = events[i];
+    if (e.type === 'assistant' && (e.text ?? '').trim()) return true;
+    // A note means the turn ended for a reason already recorded — stopped by
+    // the user, a model error, an interrupted harness. Those explain
+    // themselves; adding a summary on top would be noise.
+    if (e.type === 'note') return true;
+  }
+  return false;
+}
+
+async function closeOutTurn(opts, before) {
+  const { session, models, save, signal, onEvent, onDelta } = opts;
+  if (signal?.aborted) return;
+  if (session.events.length === before) return;      // nothing happened at all
+  if (endedWithWords(session.events, before)) return;
+
+  const spec = models[session.model];
+  if (!spec) return;
+
+  const reply = await providerFor(spec).complete({
+    client: clientFor(spec),
+    spec,
+    events: session.events,
+    system: 'Your turn is ending. In a few sentences, in the past tense, say what you did, '
+      + 'what is now true, and whether the user can use it. If something is unfinished, say what '
+      + 'remains and that you have stopped. Do not start new work and do not ask to continue.',
+    useTools: false,
+    onText: (text) => onDelta?.({ kind: 'text', text }),
+    signal,
+    cwd: session.projectDir,
+  });
+
+  const text = (reply.text ?? '').trim();
+  if (!text) return;
+  const event = assistantEvent({ ...reply, text, toolCalls: [] });
+  event.closedByGuard = true;     // so the UI can say where this came from
+  session.events.push(event);
+  await save(session);
+  onEvent?.(event);
+}
+
+async function runTurnInner({
   session, models, userText, attachments, onEvent, onDelta, save, signal, monitorsFile, activityCmd,
+  tailnetHost = null,
 }) {
   const append = async (event) => {
     session.events.push(event);
@@ -176,7 +263,14 @@ export async function runTurn({
     if (spec.provider !== 'claude-cli' && events.some((e) => e.attachments?.length)) {
       events = await Promise.all(events.map(async (e) => (
         e.attachments?.length
-          ? { ...e, attachments: await Promise.all(e.attachments.map(async (a) => ({ ...a, dataUrl: await toDataUrl(a).catch(() => null) }))) }
+          ? {
+            ...e,
+            attachments: await Promise.all(e.attachments.map(async (a) => (
+              a.role === 'document'
+                ? { ...a, base64: await toBase64(a).catch(() => null) }
+                : { ...a, dataUrl: await toDataUrl(a).catch(() => null) }
+            ))),
+          }
           : e
       )));
     }
@@ -195,7 +289,7 @@ export async function runTurn({
         client: clientFor(spec),
         spec,
         events,
-        system: systemPromptFor(session, monitorsFile, activityCmd),
+        system: systemPromptFor(session, monitorsFile, activityCmd, tailnetHost),
         onText: (text) => onDelta?.({ kind: 'text', text }),
         onThinking: (text) => onDelta?.({ kind: 'thinking', text }),
         onToolStart: (call) => onDelta?.({ kind: 'tool_start', call }),
@@ -259,6 +353,9 @@ export async function runTurn({
         projectDir: session.projectDir,
         allowOutside: !session.confineToProjectDir,
         readableDirs: session.readableDirs ?? [],
+        // So an email says which session sent it: several may be running
+        // unattended, and "it finished" is useless without knowing which.
+        sessionId: session.id,
       }, { signal, ms: spec.toolTimeoutMs ?? 120_000 });
       await append(
         toolResultEvent({ callId: call.id, name: call.name, ok: result.ok, output: result.output }),

@@ -9,9 +9,13 @@ history, what do different models actually do?*
 
 ## What it is
 
-- **Two frontends, one core.** An Electron desktop app and a LAN web app share
-  the same agent loop, session store and providers, against the same data
-  directory. A session started on your phone opens on the laptop.
+- **Apps are the durable thing; sessions are workers.** An app owns a folder, a
+  repository, a port and a start command, and survives reboots — you relaunch it
+  from the dashboard. Sessions attach to an app, several at once, each free to
+  run a different model. That is how you compare agents: one app, two sessions.
+- **One harness, two screens.** The desktop app is a window onto the same server
+  the phone uses, so both show the same thing and every feature exists in one
+  place. Opening it on a cold laptop starts the server.
 - **Mid-session model switching.** The transcript is provider-neutral, so a
   session can move from Claude to GPT to a local model and keep its history.
   Tool-call ids are preserved across the switch, which is the part that usually
@@ -21,6 +25,17 @@ history, what do different models actually do?*
   it can rewrite what the panel shows on request.
 - **Usage accounting.** Token and cost totals per model over any window, kept
   in an incrementally-updated ledger rather than recomputed from transcripts.
+  Subscription CLIs report their real plan limits, read back from what each CLI
+  records on disk.
+- **Supervision that assumes things go wrong.** Every turn keeps a liveness
+  beacon; a watcher outside the model raises an alarm when one stops making
+  progress, because a stalled agent cannot be the thing that notices. A turn
+  that ends without saying anything gets one bounded call to write its summary,
+  and a turn interrupted by a shutdown records that in its own transcript.
+- **Sessions cannot modify the harness.** File tools refuse writes into it above
+  every per-session setting, and the shell runs under a kernel sandbox
+  (`sandbox-exec`) so a path assembled at runtime is refused too. Reading is
+  allowed; a session can study the harness, it just cannot change it.
 
 ## Requirements
 
@@ -36,8 +51,8 @@ history, what do different models actually do?*
 
 ```bash
 npm install
-npm start          # desktop app
-npm run serve      # LAN web app, for phones
+npm run serve      # the harness; open the printed URL on any device
+npm start          # the same thing in a desktop window
 npm test           # the suite
 ```
 
