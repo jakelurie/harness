@@ -1104,7 +1104,8 @@ async function settingsSheet() {
     el.onclick = async () => {
       const t = cur();
       const want = el.dataset.mode;
-      if (t.session.mode === want || (want === 'agent' && t.session.mode !== 'chat')) return; // already there
+      // Always send it — never trust local state to decide "already there", or a
+      // stale copy could block the very switch the user is trying to make.
       // A silently-failed PATCH used to leave the toggle looking stuck — the
       // reported "switched to chat and couldn't switch back". Show what happened.
       el.textContent = '…';
