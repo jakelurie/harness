@@ -11,7 +11,8 @@
  * URL once and then kept in a cookie.
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { openSync } from 'node:fs';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -599,6 +600,29 @@ const server = http.createServer(async (req, res) => {
       const cfg = await saveEmailConfig(USER_DATA, { to, from, apiKey });
       return json(res, 200, { to: cfg.to, from: cfg.from, hasKey: Boolean(cfg.apiKey) });
     }
+    // ---- restart the harness to apply edits made to its own source
+    // A harness-editing session changes files, but the running process keeps
+    // the old code until it restarts. Without this, every self-edit looks
+    // broken: new endpoints 404, new UI never appears.
+    if (req.method === 'POST' && pathname === '/api/harness/restart') {
+      if (running.size) {
+        return json(res, 409, { error: `a turn is still running (${[...running.keys()].join(', ')}) — wait for it to finish, then restart` });
+      }
+      json(res, 200, { ok: true, restarting: true });
+      // A detached relauncher waits for this process to release the port, then
+      // starts a fresh server with the same environment, logging to the data dir
+      // so a failed start is diagnosable rather than silent.
+      const logFile = path.join(USER_DATA, 'server.log');
+      const out = openSync(logFile, 'a');
+      const script = `while lsof -nP -iTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; do sleep 0.2; done; `
+        + `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(path.join(__dirname, 'index.js'))}`;
+      spawn('/bin/sh', ['-c', script], {
+        detached: true, stdio: ['ignore', out, out], cwd: path.join(__dirname, '..'), env: process.env,
+      }).unref();
+      setTimeout(() => shutdown('restart'), 400);
+      return undefined;
+    }
+
     if (req.method === 'POST' && pathname === '/api/email/test') {
       try {
         const cfg = await loadEmailConfig(USER_DATA);

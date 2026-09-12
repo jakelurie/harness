@@ -113,6 +113,32 @@ const CHAT_SYSTEM = `You are a helpful assistant talking with the user. Answer w
 /** A session in chat mode carries none of the agent scaffolding. */
 export const usesTools = (session) => session?.mode !== 'chat';
 
+/**
+ * What a harness-editing session needs to work like a careful maintainer rather
+ * than guess. A fresh session has none of the context this codebase's usual
+ * editor carries, which is why unguided edits come out misplaced and untested.
+ */
+const HARNESS_GUIDE = [
+  "How this harness is built, and how to change it well:",
+  "",
+  "Layout:",
+  "- server/index.js is the HTTP server and all /api routes.",
+  "- server/public/index.html, app.js and styles.css are the one UI, used on both phone and desktop. app.js renders every screen; there is no framework and no build step.",
+  "- src/core/ is the engine: agent.js (the turn loop and this system prompt), tools.js, providers/, apps.js, git.js, store.js, transcript.js, notify.js.",
+  "- test/ holds the suite, run with: npm test",
+  "",
+  "Design system (match it exactly, or new UI looks bolted on):",
+  "- Dark theme only. Never introduce light backgrounds. Use the existing CSS custom properties (--bg, --bg-2, --bg-3, --fg, --fg-dim, --fg-faint, --line, --accent), never hard-coded colors.",
+  "- Reuse existing classes and patterns. A control in the composer copies the existing composer buttons (class attach-btn); a settings control copies the rows already in the settings sheet; a list row uses class item. Put a new control where similar controls already live, at the same size, not wedged in on its own.",
+  "- Tap targets are at least 44px. Text stays readable at phone width; nothing may cause horizontal scroll.",
+  "",
+  "Working discipline:",
+  "- Read the neighbouring code before adding to it; match its style, naming and structure.",
+  "- Run npm test before you finish and report the result. Add a test for anything you add.",
+  "- The running server holds the OLD code until it is restarted, so your file edits are NOT live until the harness restarts. After changing server or UI code, tell the user plainly that a restart is needed (there is a Restart control on the Harness app), and never claim a change works when you could not load it.",
+  "- The harness data directory (secrets, tokens, the session store, other projects) is off-limits: reads and writes there are refused. Do not try to read secrets.",
+].join('\n');
+
 export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost = null) {
   if (!usesTools(session)) {
     return session.system?.trim() ? `${CHAT_SYSTEM}\n\n${session.system.trim()}` : CHAT_SYSTEM;
@@ -142,7 +168,8 @@ export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost 
     // This is a session of the built-in Harness app: it is meant to edit the
     // harness itself. Do not tell it the harness is read-only — it is not, for
     // this session.
-    parts.push('\nYou ARE the harness. This session edits the harness\'s own source code (the project directory is the harness itself), which is exactly your job here — treat requests to change the harness as ordinary work, not something forbidden. Two limits: the harness data directory (secrets, tokens, the session store) is off-limits and writes there are refused; and changes to the running server take effect only after it restarts, so say when a restart is needed rather than assuming a change is already live.');
+    parts.push('\nYou ARE the harness. This session edits the harness\'s own source code (the project directory is the harness itself), which is exactly your job here — treat requests to change the harness as ordinary work, not something forbidden.');
+    parts.push(HARNESS_GUIDE);
   } else {
     parts.push('\nYou run inside a harness. The harness\'s own files are read-only to you: you may look at them, but any attempt to write there is refused, and that is deliberate rather than a fault to work around.');
   }

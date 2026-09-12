@@ -1824,7 +1824,11 @@ function renderAppsSheet(d) {
     const pill = a.builtin
       ? '<span class="pill self">self</span>'
       : `<span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span>`;
-    const actions = a.builtin ? '' : `<div class="app-actions">
+    const actions = a.builtin
+      ? `<div class="app-actions">
+          <button class="x" data-harness-restart="1" title="Restart the harness to apply edits made to its own code">⟳</button>
+        </div>`
+      : `<div class="app-actions">
           <button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : a.start ? 'Start' : 'No start command yet — tap to add one'}">${a.running ? '■' : '▶'}</button>
           <button class="x" data-app-edit="${esc(a.id)}" title="Edit app">✎</button>
         </div>`;
@@ -1873,6 +1877,29 @@ function renderAppsSheet(d) {
   });
   $('sheet').querySelectorAll('[data-app-run]').forEach((el) => {
     el.onclick = (e) => { e.stopPropagation(); runApp(d.apps.find((a) => a.id === el.dataset.appRun), el); };
+  });
+  $('sheet').querySelectorAll('[data-harness-restart]').forEach((el) => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      // Two taps: restarting drops every live connection for a few seconds.
+      if (el.dataset.armed !== '1') {
+        el.dataset.armed = '1'; el.textContent = '⟳?'; el.title = 'Tap again to restart the harness';
+        setTimeout(() => { el.dataset.armed = ''; el.textContent = '⟳'; }, 3000);
+        return;
+      }
+      el.disabled = true; el.textContent = '…';
+      try {
+        await api('/api/harness/restart', { method: 'POST' });
+        showBanner('restarting the harness — back in a few seconds…');
+        // Poll until it answers again, then reload so the new code is what runs.
+        const started = Date.now();
+        const tick = async () => {
+          try { await fetch('/api/state', { cache: 'no-store' }); location.reload(); }
+          catch { if (Date.now() - started < 30_000) setTimeout(tick, 700); else showBanner('the harness did not come back — check server.log in its data folder', true); }
+        };
+        setTimeout(tick, 1500);
+      } catch (err) { showBanner(err.message, true); el.disabled = false; el.textContent = '⟳'; }
+    };
   });
   $('sheet').querySelectorAll('[data-new-in]').forEach((el) => {
     el.onclick = () => { draft = { appId: el.dataset.newIn }; newSheet(); };
