@@ -85,6 +85,16 @@ check('accepts the token in the query string', (await fetch(`${root}/api/state?t
 const html = await (await call('/')).text();
 check('serves the phone UI', html.includes('<title>Harness</title>') && html.includes('app.js'));
 check('serves the voice recorder', (await call('/voice.js')).status === 200 && html.includes('id="dictate"'));
+const composer = html.match(/<footer id="composer">([\s\S]*?)<\/footer>/)?.[1] ?? '';
+const attachClasses = composer.match(/id="attach" class="([^"]+)"/)?.[1];
+const dictateClasses = composer.match(/id="dictate" class="([^"]+)"/)?.[1];
+check('microphone shares the attach button styling inside the composer',
+  attachClasses === 'ghost attach-btn' && dictateClasses === attachClasses);
+const css = await (await call('/styles.css')).text();
+check('microphone uses shared sizing without a private override', !/#dictate\s*\{/.test(css));
+const recordingStyle = css.match(/#dictate\.recording\s*\{([^}]+)\}/)?.[1] ?? '';
+check('recording indicator uses dark theme tokens', recordingStyle.includes('var(--bg-3)') &&
+  recordingStyle.includes('var(--accent)') && !/#[\da-f]{3,8}\b/i.test(recordingStyle));
 check('voice status requires authentication', (await fetch(`${root}/api/transcription`)).status === 401);
 await call('/api/models/key', { method: 'POST', body: JSON.stringify({ alias: '__transcription', apiKey: 'sk-voice-test' }) });
 const voiceStatus = await (await call('/api/transcription')).json();

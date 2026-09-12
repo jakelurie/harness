@@ -13,11 +13,13 @@
     status.hidden = false;
     if (retry) {
       const b = document.createElement('button');
+      b.className = 'ghost';
       b.textContent = 'Retry';
       b.onclick = () => upload(active);
       status.append(b);
     }
     const cancel = document.createElement('button');
+    cancel.className = 'ghost';
     cancel.textContent = 'Cancel';
     cancel.onclick = () => window.cancelDictation();
     status.append(cancel);
