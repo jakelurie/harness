@@ -1090,24 +1090,36 @@ async function settingsSheet() {
   $('sheet').querySelectorAll('[data-band]').forEach((el) => {
     el.onclick = async () => {
       const t = cur();
-      const updated = await api(`/api/sessions/${t.session.id}`, {
-        method: 'PATCH', body: JSON.stringify({ allowLongContext: el.dataset.band === 'on' }),
-      });
-      t.session = updated;
-      if (state.tab === 'chat') state.session = updated;
-      settingsSheet();
+      try {
+        const updated = await api(`/api/sessions/${t.session.id}`, {
+          method: 'PATCH', body: JSON.stringify({ allowLongContext: el.dataset.band === 'on' }),
+        });
+        t.session = updated;
+        if (state.tab === 'chat') state.session = updated;
+        settingsSheet();
+      } catch (e) { showBanner(`couldn't change that: ${e.message}`, true); }
     };
   });
   $('sheet').querySelectorAll('[data-mode]').forEach((el) => {
     el.onclick = async () => {
       const t = cur();
-      const updated = await api(`/api/sessions/${t.session.id}`, {
-        method: 'PATCH', body: JSON.stringify({ mode: el.dataset.mode }),
-      });
-      t.session = updated;
-      if (state.tab === 'chat') state.session = updated;
-      paintHeader();
-      settingsSheet();
+      const want = el.dataset.mode;
+      if (t.session.mode === want || (want === 'agent' && t.session.mode !== 'chat')) return; // already there
+      // A silently-failed PATCH used to leave the toggle looking stuck — the
+      // reported "switched to chat and couldn't switch back". Show what happened.
+      el.textContent = '…';
+      try {
+        const updated = await api(`/api/sessions/${t.session.id}`, {
+          method: 'PATCH', body: JSON.stringify({ mode: want }),
+        });
+        t.session = updated;
+        if (state.tab === 'chat') state.session = updated;
+        paintHeader();
+        settingsSheet();
+      } catch (e) {
+        showBanner(`couldn't switch mode: ${e.message} — tap again`, true);
+        settingsSheet();   // restore the buttons to their true state
+      }
     };
   });
   $('sheet').querySelectorAll('[data-switch]').forEach((el) => {
