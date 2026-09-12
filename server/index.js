@@ -19,6 +19,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 import { runTurn } from '../src/core/agent.js';
 import { loadConfig, patchModel } from '../src/core/config.js';
@@ -127,15 +128,42 @@ async function resolveToken(dir) {
 
 // ---------------------------------------------------------------- utilities
 
-const json = (res, code, body) => {
-  const text = JSON.stringify(body);
-  res.writeHead(code, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(text),
-    'Cache-Control': 'no-store',
+/**
+ * One reply, compressed when there is anything to win.
+ *
+ * A long session's JSON is most of a megabyte, and over the tailnet from a
+ * phone that transfer is the second or two between tapping a session and
+ * seeing it - gzip takes it to roughly a quarter. Compression is async so a
+ * big transcript does not stall every other session's turn, and anything
+ * under a packet is sent as-is because framing it would cost more than it
+ * saves. The stream endpoints write their own headers and are untouched:
+ * buffering an event stream would defeat the point of it.
+ */
+function send(res, code, type, buf) {
+  const head = { 'Content-Type': type, 'Cache-Control': 'no-store' };
+
+  if (!res.gzipOk || buf.length < 1400) {
+    head['Content-Length'] = buf.length;
+    res.writeHead(code, head);
+    return res.end(buf);
+  }
+
+  zlib.gzip(buf, (err, gz) => {
+    // A failed compress must still answer the request, just uncompressed.
+    const body = err ? buf : gz;
+    if (!err) {
+      head['Content-Encoding'] = 'gzip';
+      head.Vary = 'Accept-Encoding';
+    }
+    head['Content-Length'] = body.length;
+    res.writeHead(code, head);
+    res.end(body);
   });
-  res.end(text);
-};
+  return undefined;
+}
+
+const json = (res, code, body) =>
+  send(res, code, 'application/json; charset=utf-8', Buffer.from(JSON.stringify(body)));
 
 async function readBody(req) {
   const chunks = [];
@@ -293,11 +321,7 @@ async function serveStatic(res, name) {
     const file = path.join(PUBLIC, name);
     if (!file.startsWith(PUBLIC)) return json(res, 403, { error: 'forbidden' });
     const body = await fs.readFile(file);
-    res.writeHead(200, {
-      'Content-Type': `${MIME[path.extname(file)] ?? 'application/octet-stream'}; charset=utf-8`,
-      'Cache-Control': 'no-store',
-    });
-    res.end(body);
+    send(res, 200, `${MIME[path.extname(file)] ?? 'application/octet-stream'}; charset=utf-8`, body);
   } catch {
     json(res, 404, { error: 'not found' });
   }
@@ -308,6 +332,7 @@ async function serveStatic(res, name) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const { pathname } = url;
+  res.gzipOk = /\bgzip\b/.test(req.headers['accept-encoding'] ?? '');
 
   if (!authorized(req, url)) {
     res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });

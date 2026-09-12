@@ -130,6 +130,29 @@ const session = await (await call('/api/sessions', {
 })).json();
 check('creates a session', Boolean(session.id));
 
+// ---- compression: the transcript is the big thing on the wire ----
+{
+  const bulky = 'x'.repeat(40_000);
+  await call(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ system: bulky }) });
+  const res = await call(`/api/sessions/${session.id}`);   // fetch asks for gzip by default
+  check('a big reply is gzipped', res.headers.get('content-encoding') === 'gzip');
+  check('and is far smaller on the wire than the JSON',
+    Number(res.headers.get('content-length')) < 5_000, res.headers.get('content-length'));
+  check('while still decoding to the same session', (await res.json()).system === bulky);
+
+  const plain = await fetch(`${root}/api/sessions/${session.id}`, {
+    headers: { 'x-harness-token': TOKEN, 'Accept-Encoding': 'identity' },
+  });
+  check('a client that cannot take gzip gets it uncompressed',
+    !plain.headers.get('content-encoding') && (await plain.json()).system === bulky);
+
+  const small = await call('/api/transcription');
+  check('a reply too small to be worth compressing is sent as-is',
+    !small.headers.get('content-encoding'));
+
+  await call(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ system: '' }) });
+}
+
 const frames = [];
 const streamDone = (async () => {
   const res = await call(`/api/sessions/${session.id}/events`);
@@ -354,6 +377,20 @@ check('a repointed session is no longer flagged',
     /t\.session = updated/.test(clientSrc) && /setSessionModel/.test(clientSrc));
   check('and the settings sheet offers a real switch control',
     /data-switch=/.test(clientSrc));
+  // Both of these are about how the phone *feels*: the sheet and the session
+  // have to go up before the fetch they depend on, not after it.
+  const appsSrc = clientSrc.slice(clientSrc.indexOf('async function appsSheet()'), clientSrc.indexOf('function renderAppsSheet'));
+  check('the apps sheet draws before it fetches',
+    appsSrc.indexOf('renderAppsSheet(lastAppsData)') < appsSrc.indexOf('await Promise.all'));
+  check('and asks for apps and state together, not one after the other',
+    /await Promise\.all\(\[api\('\/api\/apps'\), refreshState\(\)\]\)/.test(appsSrc));
+  const openSrc = clientSrc.slice(clientSrc.indexOf('async function openSession('), clientSrc.indexOf('/** The monitoring tab'));
+  check('opening a session closes the list before awaiting the transcript',
+    openSrc.indexOf('closeSheet()') < openSrc.indexOf('await api(`/api/sessions/'));
+  check('and a second tap while the first is loading wins',
+    openSrc.includes('if (openingSession !== id) return;'));
+  check('deleting a session drops it from the local list too, so the redraw agrees',
+    /state\.sessions = state\.sessions\.filter\(\(x\) => x\.id !== id\);/.test(clientSrc));
   const settingsSrc = clientSrc.slice(clientSrc.indexOf('async function settingsSheet()'), clientSrc.indexOf('const backToSettings'));
   check('reference folders stay visible beside project settings',
     settingsSrc.includes('Reference folders (read-only)') &&

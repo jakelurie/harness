@@ -576,10 +576,12 @@ function httpReachable(port) {
 }
 
 export async function listWithStatus(userDataDir) {
-  const apps = await load(userDataDir);
-  const host = await tailnetHost();
-  const procs = await listeningProcesses();
-  const map = await serveMap();
+  // All four at once. They are independent - a registry read, a tailnet
+  // lookup and two shell-outs - and run one after another they were most of
+  // the wait before the apps sheet could draw anything.
+  const [apps, host, procs, map] = await Promise.all([
+    load(userDataDir), tailnetHost(), listeningProcesses(), serveMap(),
+  ]);
 
   return Promise.all(apps.map(async (app) => {
     const info = runningInfo(app, procs);

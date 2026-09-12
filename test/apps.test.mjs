@@ -81,6 +81,13 @@ check('and actually answering on its port', res === 'ok', res);
 const listed = (await apps.listWithStatus(data)).find((x) => x.id === a.id);
 check('the dashboard sees it as running', listed.running === true);
 
+// Nothing in the result shows whether the probes ran together or one after
+// another, and serially they were most of the wait before the phone's apps
+// sheet could draw - so guard the shape of the call itself.
+const appsSrc = await fs.readFile(new URL('../src/core/apps.js', import.meta.url), 'utf8');
+check('the status probes run together, not in series',
+  /Promise\.all\(\[\s*load\(userDataDir\), tailnetHost\(\), listeningProcesses\(\), serveMap\(\),?\s*\]\)/.test(appsSrc));
+
 const stopped = await apps.stop(data, a.id);
 check('stopping it is confirmed, not assumed', stopped.stopped === true && !stopped.unconfirmed);
 check('and it is really gone', !(await apps.isRunning(run.app)));

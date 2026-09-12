@@ -131,11 +131,17 @@ const shortDir = (p) => String(p ?? '').replace(state.home, '~');
 
 // ------------------------------------------------------------------ sheet
 
-function openSheet(html) {
+// Which sheet is showing. A slow fetch that lands after you have moved on
+// must not redraw over the sheet you are now looking at.
+let sheetView = null;
+
+function openSheet(html, view = null) {
+  sheetView = view;
   $('sheet').innerHTML = html;
   $('sheet-back').hidden = false;
 }
 function closeSheet() {
+  sheetView = null;
   $('sheet-back').hidden = true;
   $('sheet').innerHTML = '';
 }
@@ -544,9 +550,39 @@ function clearLive(tab = state.tab) {
 
 // ---------------------------------------------------------------- session
 
+let openingSession = null;   // the tap we are still fetching for
+
 async function openSession(id) {
   window.cancelDictation?.();
-  const session = await api(`/api/sessions/${id}`);
+  openingSession = id;
+
+  // Answer the tap before doing the work. Fetching a session pulls its whole
+  // transcript down - a long one is a few hundred kilobytes even compressed -
+  // and leaving the list sitting there until it arrived made the tap look like
+  // it had been missed. The name and folder are already known from the list,
+  // so the header can be right immediately and only the body has to wait.
+  closeSheet();
+  const meta = state.sessions.find((x) => x.id === id);
+  if (meta) {
+    $('title-name').textContent = meta.name;
+    $('title-sub').textContent = `${meta.model} · ${shortDir(meta.projectDir)}`;
+  }
+  $('transcript').innerHTML = '<div class="empty"><p class="dim">loading…</p></div>';
+
+  let session;
+  try {
+    session = await api(`/api/sessions/${id}`);
+  } catch (e) {
+    if (openingSession !== id) return;
+    openingSession = null;
+    showBanner(e.message);
+    drawTranscript();     // back to whatever was open before
+    return;
+  }
+  // Tapping a second session while the first is still coming: the later tap wins.
+  if (openingSession !== id) return;
+  openingSession = null;
+
   state.session = session;
   tabs.chat.session = session;
   tabs.monitor.session = null;          // loaded when the tab is first opened
@@ -559,12 +595,14 @@ async function openSession(id) {
   setTab('chat');
   listen('chat', id);
   refreshBackground();
-  closeSheet();
 }
 
 /** The monitoring tab's companion session, created on the server on demand. */
 async function ensureMonitorSession() {
   if (tabs.monitor.session) return tabs.monitor.session;
+  // The tabs are reachable while a session is still loading now that the list
+  // closes on the tap rather than on the reply, so there may not be one yet.
+  if (!state.session) throw new Error('open a session first — tap ☰');
   const companion = await api(`/api/sessions/${state.session.id}/monitor`);
   tabs.monitor.session = companion;
   listen('monitor', companion.id);
@@ -1776,12 +1814,25 @@ const expandedApps = new Set();
 let lastAppsData = null;   // cached so expand/collapse re-renders without refetching
 
 async function appsSheet() {
+  // Draw first, fetch second. This used to wait on /api/apps - which shells out
+  // to lsof and tailscale - and then on /api/state, two round trips in series,
+  // before a single pixel appeared, so tapping the sidebar felt dead for about
+  // a second. The last known list goes up immediately and the fresh one folds
+  // in when it lands; only the very first open of the session has nothing to
+  // show. The two requests now go out together rather than one after the other.
+  if (lastAppsData) renderAppsSheet(lastAppsData);
+  else openSheet('<h2>Apps &amp; sessions</h2><p class="dim">loading…</p>', 'apps');
+
   let d;
-  try { d = await api('/api/apps'); }
-  catch (e) { return openSheet(`<h2>Apps</h2><p class="dim">${esc(e.message)}</p>`); }
-  await refreshState();
+  try { [d] = await Promise.all([api('/api/apps'), refreshState()]); }
+  catch (e) {
+    if (sheetView !== 'apps') return;
+    if (lastAppsData) return showBanner(e.message);   // stale but usable beats blank
+    return openSheet(`<h2>Apps</h2><p class="dim">${esc(e.message)}</p>`, 'apps');
+  }
   lastAppsData = d;
-  renderAppsSheet(d);
+  if (sheetView === 'apps') renderAppsSheet(d);
+  return undefined;
 }
 
 /**
@@ -1793,6 +1844,9 @@ async function appsSheet() {
  * change, so it re-renders from the cached data instead.
  */
 function renderAppsSheet(d) {
+  // Redrawing throws the scroll position away, which is wrong both for an
+  // expander tap and for the refresh that lands a moment after the sheet opens.
+  const scroll = sheetView === 'apps' ? $('sheet').scrollTop : 0;
   const sessionsFor = (id) => state.sessions.filter((x) => x.appId === id);
   const known = new Set(d.apps.map((a) => a.id));
   const loose = state.sessions.filter((x) => !x.appId || !known.has(x.appId));
@@ -1859,7 +1913,8 @@ function renderAppsSheet(d) {
     <div class="actions">
       <button class="primary" id="app-new">new app</button>
       <button class="ghost" id="sess-new">new session</button>
-    </div>`);
+    </div>`, 'apps');
+  if (scroll) $('sheet').scrollTop = scroll;
 
   // --- app-level actions ---
   $('app-new').onclick = () => appEditSheet(null);
@@ -1927,6 +1982,11 @@ function renderAppsSheet(d) {
         const fresh = await api(`/api/sessions/${id}`);
         tabs.chat.session = fresh; state.session = fresh; paintHeader();
       }
+      // The sheet now redraws from the local list before the server answers,
+      // so the local list has to already agree - otherwise the old name shows
+      // for a moment and the rename looks like it did not take.
+      const local = state.sessions.find((x) => x.id === id);
+      if (local) local.name = name.trim();
       appsSheet();
     };
   });
@@ -1937,6 +1997,7 @@ function renderAppsSheet(d) {
       if (!confirm('Delete this session?')) return;
       await api(`/api/sessions/${id}`, { method: 'DELETE' });
       if (state.session?.id === id) { state.session = null; drawTranscript(); paintHeader(); }
+      state.sessions = state.sessions.filter((x) => x.id !== id);   // gone now, not after the refetch
       appsSheet();
     };
   });
