@@ -1821,7 +1821,7 @@ async function appsSheet() {
   // in when it lands; only the very first open of the session has nothing to
   // show. The two requests now go out together rather than one after the other.
   if (lastAppsData) renderAppsSheet(lastAppsData);
-  else openSheet('<h2>Apps &amp; sessions</h2><p class="dim">loading…</p>', 'apps');
+  else openSheet('<h2>Projects &amp; sessions</h2><p class="dim">loading…</p>', 'apps');
 
   let d;
   try { [d] = await Promise.all([api('/api/apps'), refreshState()]); }
@@ -1861,6 +1861,7 @@ function renderAppsSheet(d) {
     </div>`;
 
   const appCard = (a) => {
+    const launchable = Boolean(a.start?.trim());
     const mine = sessionsFor(a.id);
     const open = expandedApps.has(a.id);
     const label = !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
@@ -1873,18 +1874,19 @@ function renderAppsSheet(d) {
     // record, or deleted.
     const meta = a.builtin
       ? `<div class="s dim">the harness itself — sessions here edit its code</div>`
-      : `<div class="s">${esc(shortDir(a.dir))}${a.start ? '' : ' · no start command'}</div>
+      : `<div class="s">${esc(shortDir(a.dir))}</div>
          ${a.running && a.reachable && links.length ? `<div class="s app-links">${links.join('<br>')}</div>` : ''}`;
     const pill = a.builtin
       ? '<span class="pill self">self</span>'
+      : !launchable && !a.running ? '<span class="pill">workspace</span>'
       : `<span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span>`;
     const actions = a.builtin
       ? `<div class="app-actions">
           <button class="x" data-harness-restart="1" title="Restart the harness to apply edits made to its own code">⟳</button>
         </div>`
       : `<div class="app-actions">
-          <button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : a.start ? 'Start' : 'No start command yet — tap to add one'}">${a.running ? '■' : '▶'}</button>
-          <button class="x" data-app-edit="${esc(a.id)}" title="Edit app">✎</button>
+          ${launchable || a.running ? `<button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : 'Start'}">${a.running ? '■' : '▶'}</button>` : ''}
+          <button class="x" data-app-edit="${esc(a.id)}" title="Edit project">✎</button>
         </div>`;
 
     return `<div class="app-block${open ? ' open' : ''}${a.builtin ? ' builtin' : ''}">
@@ -1904,14 +1906,14 @@ function renderAppsSheet(d) {
     </div>`;
   };
 
-  const appsHtml = d.apps.length ? d.apps.map(appCard).join('') : '<p class="dim">no apps yet — an app is a project you can launch, open and work on</p>';
+  const appsHtml = d.apps.length ? d.apps.map(appCard).join('') : '<p class="dim">no projects yet — create an app or a workspace</p>';
   const looseHtml = loose.length
-    ? `<h3>Not in an app</h3>${loose.map(sessionRow).join('')}`
+    ? `<h3>Other sessions</h3>${loose.map(sessionRow).join('')}`
     : '';
 
-  openSheet(`<h2>Apps &amp; sessions</h2>${appsHtml}${looseHtml}
+  openSheet(`<h2>Projects &amp; sessions</h2>${appsHtml}${looseHtml}
     <div class="actions">
-      <button class="primary" id="app-new">new app</button>
+      <button class="primary" id="app-new">new project</button>
       <button class="ghost" id="sess-new">new session</button>
     </div>`, 'apps');
   if (scroll) $('sheet').scrollTop = scroll;
@@ -2078,12 +2080,13 @@ function appEditSheet(app = null, draft = null) {
   const existing = Boolean(app?.id);
   const a = draft ?? app ?? { name: '', dir: '', start: '', repo: '' };
 
-  openSheet(`<h2>${existing ? 'Edit app' : 'New app'}</h2>
+  openSheet(`<h2>${existing ? 'Edit project' : 'New project'}</h2>
     <label>Name</label><input id="ap-name" value="${esc(a.name ?? '')}" spellcheck="false" placeholder="what you're building" />
     <label>Folder${existing ? '' : ' — made for you from the name'}</label>
     <div class="row"><input id="ap-dir" value="${esc(a.dir ?? '')}" spellcheck="false" ${existing ? 'disabled' : ''} />
       ${existing ? '' : '<button class="ghost" id="ap-browse" style="flex:0 0 80px">browse</button>'}</div>
-    <label>Start command</label>
+    <label>Start command (optional)</label>
+    <p class="dim">Leave empty for a workspace with sessions and no play button. Add a command to make it a launchable app.</p>
     <input id="ap-start" value="${esc(a.start ?? '')}" spellcheck="false" placeholder="npm run dev" />
     <p class="dim">Runs in the app's folder with <span class="mono">PORT</span> set${existing ? ` to ${app.port}` : ' to the port this app is given'}.</p>
     <label>Repository (optional)</label>
@@ -2091,7 +2094,7 @@ function appEditSheet(app = null, draft = null) {
     ${existing && a.repo ? `<label>GitHub visibility</label>
       <div id="ap-vis"><p class="dim">checking…</p></div>` : ''}
     <div class="actions">
-      <button class="primary" id="ap-save">${existing ? 'save' : 'create app'}</button>
+      <button class="primary" id="ap-save">${existing ? 'save' : 'create project'}</button>
       <button class="ghost" id="ap-back">back</button>
       ${existing ? '<button class="ghost" id="ap-log">view log</button><button class="ghost" id="ap-del">delete</button>' : ''}
     </div>`);
