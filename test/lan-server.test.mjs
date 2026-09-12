@@ -440,14 +440,6 @@ check('a repointed session is no longer flagged',
   await fh.close().catch(() => {});
 }
 
-// ---- a look at the laptop screen ----
-const screen = await call('/api/screen');
-check('screen endpoint returns an image, or explains why it cannot',
-  screen.status === 200
-    ? (screen.headers.get('content-type') ?? '').startsWith('image/')
-    : [500, 503].includes(screen.status) && typeof (await screen.clone().json()).error === 'string',
-  `status=${screen.status} type=${screen.headers.get('content-type')}`);
-
 // ---- the default is open; auth only when asked for ----
 const openPort = PORT + 1;
 const openChild = spawn(process.execPath, [path.join(here, '..', 'server', 'index.js')], {

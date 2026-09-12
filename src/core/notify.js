@@ -14,6 +14,8 @@
  */
 
 import { execFile } from 'node:child_process';
+
+import { sendSms } from './sms.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -58,6 +60,32 @@ const APPLESCRIPT = `on run argv
   end tell
 end run`;
 
+/**
+ * How long to wait on Messages before calling it stuck.
+ *
+ * Short on purpose. When it works it is immediate; when it does not it never
+ * returns, so a long wait only means staring at "sending…" before getting the
+ * same bad news.
+ */
+const SEND_TIMEOUT_MS = 8000;
+
+const MESSAGES_WEDGED =
+  'Messages accepted the connection but never answered. This happens when the Mac\'s display is '
+  + 'asleep — its scripting bridge needs a live screen session, so texting cannot work with the lid '
+  + 'shut. Open the lid and try again, or switch this to a webhook, which does not depend on the Mac.';
+
+/** osascript buries the real error under the whole script; dig it back out. */
+function cleanOsascriptError(stderr, err) {
+  const text = String(stderr || err?.message || '').trim();
+  // Real failures appear as "execution error: ..." or on the last line;
+  // everything before that is the script being echoed back.
+  const m = text.match(/execution error:\s*(.+)/i);
+  if (m) return m[1].trim().slice(0, 200);
+  if (err?.killed || /timed out/i.test(text)) return MESSAGES_WEDGED;
+  const last = text.split('\n').filter((l) => l.trim() && !/^\s*(on run|set |tell |try|end |repeat|return|  )/.test(l)).pop();
+  return (last || text).slice(0, 200);
+}
+
 /** Never let a notifier outlive its usefulness. */
 function bounded(promise, ms, onTimeout) {
   let timer;
@@ -72,18 +100,46 @@ export async function send(cfg, text) {
 
   if (cfg.kind === 'messages') {
     if (!cfg.to) return { ok: false, reason: 'no phone number set' };
+
+    // Probe first. Talking to Messages at all is instant when it works, while
+    // asking it for its accounts hangs outright when the Mac's display is
+    // asleep — the scripting bridge needs a live window server. Separating the
+    // two turns a 25-second wait on a truncated error into a fast, accurate
+    // answer about which part is unavailable.
+    const reachable = await bounded(
+      new Promise((resolve) => {
+        execFile('osascript', ['-e', 'tell application "Messages" to return "ok"'], { timeout: 4000 },
+          (err) => resolve(!err));
+      }),
+      5000,
+      false,
+    );
+    if (!reachable) {
+      return { ok: false, reason: 'Messages is not responding to AppleScript. Check System Settings → Privacy & Security → Automation and allow it to be controlled.' };
+    }
+
     const run = new Promise((resolve) => {
-      execFile('osascript', ['-e', APPLESCRIPT, cfg.to, text], { timeout: 25_000 },
-        (err, stdout, stderr) => resolve(
-          err
-            ? { ok: false, reason: (stderr || err.message || '').trim().slice(0, 200) }
-            : { ok: !/^failed/.test(stdout.trim()), via: stdout.trim(), reason: /^failed/.test(stdout.trim()) ? stdout.trim() : null },
-        ));
+      execFile('osascript', ['-e', APPLESCRIPT, cfg.to, text], { timeout: SEND_TIMEOUT_MS },
+        (err, stdout, stderr) => {
+          const said = stdout.trim();
+          if (!err) {
+            return resolve({ ok: !/^failed/.test(said), via: said, reason: /^failed/.test(said) ? said : null });
+          }
+          // execFile puts the entire script into err.message, which buried the
+          // real cause under forty lines of AppleScript.
+          return resolve({ ok: false, reason: cleanOsascriptError(stderr, err) });
+        });
     });
-    return bounded(run, 28_000, {
+    return bounded(run, SEND_TIMEOUT_MS + 1500, {
       ok: false,
-      reason: 'Messages did not respond — macOS is probably waiting on an Automation permission dialog. Approve it once with the lid open (System Settings → Privacy & Security → Automation).',
+      reason: MESSAGES_WEDGED,
     });
+  }
+
+  // A real SMS, through the carrier's email gateway. Unlike the Messages
+  // route this needs nothing from the Mac, so it works with the lid shut.
+  if (cfg.kind === 'sms') {
+    return sendSms({ to: cfg.to, user: cfg.gmailUser, pass: cfg.gmailPass, carrier: cfg.carrier }, text);
   }
 
   if (cfg.kind === 'webhook') {

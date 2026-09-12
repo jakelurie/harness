@@ -27,7 +27,7 @@ const tabs = {
 };
 
 const state = {
-  models: {}, default: null, sessions: [],
+  models: {}, default: null, sessions: [], beacons: {},
   session: null,          // the chat session; identity of the pair
   home: '',
   tab: 'chat',
@@ -493,7 +493,7 @@ function drawTranscript() {
   const s = cur().session;
   const el = $('transcript');
   if (!s) {
-    el.innerHTML = '<div class="empty"><p>no session open</p><p class="dim">tap ☰ for sessions · 🚀 for apps</p></div>';
+    el.innerHTML = '<div class="empty"><p>nothing open</p><p class="dim">tap ☰ for your apps &amp; sessions</p></div>';
     return;
   }
   if (!s.events.length) {
@@ -651,7 +651,7 @@ function setRunning(on, startedAt = null, last = null, tab = state.tab) {
 
 const idlePlaceholder = () => (state.tab === 'monitor'
   ? 'ask about or change the view above…'
-  : 'Describe what you want built…');
+  : 'Describe what to build…');
 
 function setActivity(name) {
   $('working-what').textContent = name ? `· ${name}` : '';
@@ -785,6 +785,7 @@ async function refreshState() {
   state.sessions = s.sessions ?? [];
   state.home = s.home ?? '';
   state.busy = s.running ?? [];
+  state.beacons = s.beacons ?? {};
   if (s.error) showBanner(s.error);
   // Keep the composer honest if the page was reloaded mid-turn.
   // Each tab is a different session, so each is reconciled against its own
@@ -818,68 +819,29 @@ function modelOptions(selected) {
     .join('');
 }
 
-async function sessionsSheet() {
-  await refreshState();
-  const rows = state.sessions.length
-    ? state.sessions
-        .map(
-          (s) => `<div class="item${s.id === state.session?.id ? ' on' : ''}" data-open="${esc(s.id)}">
-            <div class="grow"><div class="t">${esc(s.name)}</div>
-            <div class="s">${esc(s.model)} · ${s.turns} turns · ${esc(shortDir(s.projectDir))}</div></div>
-            <button class="x" data-rename="${esc(s.id)}">✎</button>
-            <button class="x" data-del="${esc(s.id)}">×</button></div>`,
-        )
-        .join('')
-    : '<p class="dim">no sessions yet</p>';
-
-  openSheet(`<h2>Sessions</h2>${rows}
-    <div class="actions">
-      <button class="primary" id="new">new session</button>
-      ${state.session ? '<button class="ghost" id="fork">fork onto…</button>' : ''}
-    </div>`);
-
-  $('new').onclick = newSheet;
-  if ($('fork')) $('fork').onclick = forkSheet;
-
-  $('sheet').querySelectorAll('[data-open]').forEach((el) => {
-    el.onclick = (e) => {
-      // Taps on the row's own buttons are theirs, not the row's.
-      if (e.target.dataset.del || e.target.dataset.rename) return;
-      openSession(el.dataset.open);
-    };
-  });
-  $('sheet').querySelectorAll('[data-rename]').forEach((el) => {
-    el.onclick = async (e) => {
-      e.stopPropagation();
-      const id = el.dataset.rename;
-      const current = state.sessions.find((x) => x.id === id)?.name ?? '';
-      const name = prompt('Rename session', current);
-      if (!name?.trim() || name === current) return;
-      await api(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) });
-      if (state.session?.id === id) {
-        const fresh = await api(`/api/sessions/${id}`);
-        tabs.chat.session = fresh;
-        state.session = fresh;
-        paintHeader();
-      }
-      sessionsSheet();
-    };
-  });
-  $('sheet').querySelectorAll('[data-del]').forEach((el) => {
-    el.onclick = async (e) => {
-      e.stopPropagation();
-      const id = el.dataset.del;
-      if (!confirm('Delete this session?')) return;
-      await api(`/api/sessions/${id}`, { method: 'DELETE' });
-      if (state.session?.id === id) {
-        state.session = null;
-        drawTranscript();
-        paintHeader();
-      }
-      sessionsSheet();
-    };
-  });
+/**
+ * What a session is doing, at a glance in the browser.
+ *
+ * Three states worth telling apart: working, waiting on you, and working but
+ * gone quiet for longer than its backend should. The last one matters because
+ * an agent CLI can be silent for a long time legitimately, so it is reported as
+ * "quiet" rather than as a failure.
+ */
+function sessionStatus(s) {
+  // `busy`, not `running`: a local boolean already owns that name here.
+  const running = (state.busy ?? []).includes(s.id);
+  if (!running) return '<span class="sstat waiting">waiting for you</span>';
+  const b = state.beacons?.[s.id];
+  if (b?.stalled) {
+    return `<span class="sstat quiet">quiet ${Math.round(b.silentMs / 60000)}m</span>`;
+  }
+  const what = b?.lastActivity ? String(b.lastActivity).split(/\s+/)[0] : '';
+  return `<span class="sstat thinking"><span class="pulse"></span>thinking${what ? ` · ${esc(what)}` : ''}</span>`;
 }
+
+// Sessions and apps live in one view (see appsSheet). Kept as an alias so
+// existing callers that refresh the list still work.
+async function sessionsSheet() { return appsSheet(); }
 
 let draft = {};   // survives a detour through the directory browser
 
@@ -1031,14 +993,6 @@ async function browseSheet(start, pick, back = newSheet) {
 
 async function settingsSheet() {
   await refreshState();
-  const rows = Object.values(state.models)
-    .map(
-      (m) => `<div class="item" data-model="${esc(m.alias)}">
-        <div class="grow"><div class="t">${esc(m.label ?? m.alias)}</div>
-        <div class="s">${esc(m.provider)} · ${esc(m.model)}</div></div>
-        <span class="pill ${m.hasKey ? 'ready' : 'missing'}">${m.hasKey ? (m.keySource ?? 'ready') : 'no key'}</span></div>`,
-    )
-    .join('');
   const session = cur().session;
   openSheet(`
     ${session ? `<h2>This ${state.tab === 'monitor' ? 'monitoring ' : ''}session</h2>
@@ -1060,40 +1014,45 @@ async function settingsSheet() {
         <button class="ghost${session.mode === 'chat' ? ' on' : ''}" data-mode="chat">chat</button>
       </div>
       <p class="dim">chat sends no tools and no project rules — much less context, better for plain questions.</p>
-      ${(() => {
-        const m = state.models[session.model];
-        if (!m?.softLimitTokens) return '';
-        const on = Boolean(session.allowLongContext);
-        return `<label>Context band</label>
-          <div class="row">
-            <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(m.softLimitTokens)}</button>
-            <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(m.contextTokens)}</button>
-          </div>
-          <p class="dim">${esc(m.label ?? m.alias)} reprices the whole request past
-            ${compact(m.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
-            output to fit; allowing it keeps everything and pays the higher rate.</p>`;
-      })()}
-      <label>Also readable (one folder per line, read-only)</label>
-      <textarea id="s-readable" spellcheck="false"
-        placeholder="/Users/you/Projects/otherProject">${esc((session.readableDirs ?? []).join('\n'))}</textarea>
-      <div class="actions"><button class="ghost" id="s-readable-save">save folders</button></div>
-      <label>Git</label>
-      <div id="s-git"><p class="dim">checking…</p></div>
-      <label>Project directory${session.projectDirMissing ? ' — missing!' : ''}</label>
+      <label>Project folder${session.projectDirMissing ? ' — missing!' : ''}</label>
       <div class="row"><input id="s-dir" value="${esc(session.projectDir)}" spellcheck="false" />
       <button class="ghost" id="s-browse" style="flex:0 0 92px">browse</button></div>
-      <div class="actions"><button class="ghost" id="s-dir-save">save directory</button></div>` : ''}
+      <div class="actions"><button class="ghost" id="s-dir-save">save folder</button></div>
+      <label>Git</label>
+      <div id="s-git"><p class="dim">checking…</p></div>
+      <details class="more"><summary>More options</summary>
+        ${(() => {
+          const m = state.models[session.model];
+          if (!m?.softLimitTokens) return '';
+          const on = Boolean(session.allowLongContext);
+          return `<label>Context band</label>
+            <div class="row">
+              <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(m.softLimitTokens)}</button>
+              <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(m.contextTokens)}</button>
+            </div>
+            <p class="dim">${esc(m.label ?? m.alias)} reprices the whole request past
+              ${compact(m.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
+              output to fit; allowing it keeps everything and pays the higher rate.</p>`;
+        })()}
+        <label>Also readable (one folder per line, read-only)</label>
+        <textarea id="s-readable" spellcheck="false"
+          placeholder="/Users/you/Projects/otherProject">${esc((session.readableDirs ?? []).join('\n'))}</textarea>
+        <div class="actions"><button class="ghost" id="s-readable-save">save folders</button></div>
+      </details>` : ''}
 
-    <h3>Notify me when a turn finishes</h3>
-    <div id="s-notify"><p class="dim">loading…</p></div>
-
-    <h3>Email</h3>
-    <p class="dim">Any session can email you with <span class="mono">send_email</span> — useful when a long run finishes and you are not watching.</p>
-    <div id="s-email"><p class="dim">loading…</p></div>
-
-    <h3>Configure a model</h3>
-    <p class="dim">Keys and endpoints — this edits what a model <em>is</em>, for every session. It does not switch this session's model; use the list above for that.</p>${rows}
+    <h3>Harness</h3>
+    <div class="rowlinks">
+      <button class="rowlink" id="h-files"><span>Files</span><span class="chev">›</span></button>
+      <button class="rowlink" id="h-models"><span>Models &amp; keys</span><span class="chev">›</span></button>
+      <button class="rowlink" id="h-notify"><span>Notifications</span><span class="chev">›</span></button>
+      <button class="rowlink" id="h-email"><span>Email</span><span class="chev">›</span></button>
+    </div>
     <div class="actions"><button class="primary" id="s-close">done</button></div>`);
+
+  $('h-files').onclick = () => filesSheet();
+  $('h-models').onclick = modelsSheet;
+  $('h-notify').onclick = notifySheet;
+  $('h-email').onclick = emailSheet;
 
   $('s-close').onclick = closeSheet;
   if ($('s-rename')) {
@@ -1127,8 +1086,6 @@ async function settingsSheet() {
       settingsSheet();
     };
   }
-  if ($('s-notify')) paintNotify();
-  if ($('s-email')) paintEmail();
   if ($('s-git')) paintGit(session);
   $('sheet').querySelectorAll('[data-band]').forEach((el) => {
     el.onclick = async () => {
@@ -1166,9 +1123,49 @@ async function settingsSheet() {
     }, settingsSheet);
     $('s-dir-save').onclick = () => setProjectDir($('s-dir').value.trim()).then(settingsSheet);
   }
+}
+
+/**
+ * Harness-wide settings, one sheet each.
+ *
+ * These used to sit inline below the session settings, which made one very
+ * long scroll — and put a second full list of model cards under the first,
+ * which was mistaken for the switcher more than once. Each now has its own
+ * sheet with a way back, so the main settings stay one screen.
+ */
+const backToSettings = '<div class="actions"><button class="ghost" id="sub-back">‹ settings</button></div>';
+
+async function modelsSheet() {
+  await refreshState();
+  const rows = Object.values(state.models).map((m) => `
+    <div class="item" data-model="${esc(m.alias)}">
+      <div class="grow"><div class="t">${esc(m.label ?? m.alias)}</div>
+      <div class="s">${esc(m.provider)} · ${esc(m.model)}</div></div>
+      <span class="pill ${m.hasKey ? 'ready' : 'missing'}">${m.hasKey ? (m.keySource ?? 'ready') : 'no key'}</span>
+    </div>`).join('');
+  openSheet(`<h2>Models &amp; keys</h2>
+    <p class="dim">Keys and endpoints — this edits what a model <em>is</em>, for every session. To switch what this session uses, go back and tap a model there.</p>
+    ${rows}${backToSettings}`);
+  $('sub-back').onclick = settingsSheet;
   $('sheet').querySelectorAll('[data-model]').forEach((el) => {
     el.onclick = () => modelSheet(el.dataset.model);
   });
+}
+
+function notifySheet() {
+  openSheet(`<h2>Notifications</h2>
+    <p class="dim">When a turn finishes, and when one stalls.</p>
+    <div id="s-notify"><p class="dim">loading…</p></div>${backToSettings}`);
+  $('sub-back').onclick = settingsSheet;
+  paintNotify();
+}
+
+function emailSheet() {
+  openSheet(`<h2>Email</h2>
+    <p class="dim">Any session can email you with <span class="mono">send_email</span> — useful when a long run finishes and you are not watching.</p>
+    <div id="s-email"><p class="dim">loading…</p></div>${backToSettings}`);
+  $('sub-back').onclick = settingsSheet;
+  paintEmail();
 }
 
 /**
@@ -1236,8 +1233,9 @@ async function paintNotify() {
   try { n = await api('/api/notify'); } catch (e) { box.innerHTML = `<p class="dim">${esc(e.message)}</p>`; return; }
 
   const kinds = [
-    ['messages', 'text message'],
-    ['webhook', 'webhook / push'],
+    ['sms', 'text (SMS)'],
+    ['webhook', 'push (ntfy)'],
+    ['messages', 'iMessage'],
     ['command', 'shell command'],
   ];
   box.innerHTML = `
@@ -1249,8 +1247,24 @@ async function paintNotify() {
       ${kinds.map(([k, label]) =>
     `<button class="ghost${n.kind === k ? ' on' : ''}" data-nkind="${k}">${label}</button>`).join('')}
     </div>
-    ${n.kind === 'messages'
-      ? `<label>Phone number</label><input id="n-to" value="${esc(n.to ?? '')}" placeholder="+18045551234" inputmode="tel" />`
+    ${n.kind === 'sms'
+      ? `<label>Phone number</label>
+         <input id="n-to" value="${esc(n.to ?? '')}" placeholder="8045551234" inputmode="tel" />
+         <label>Gmail address it sends from</label>
+         <input id="n-guser" value="${esc(n.gmailUser ?? '')}" placeholder="you@gmail.com" inputmode="email" spellcheck="false" />
+         <label>Gmail app password ${n.hasGmailPass ? '<span class="pill ready">saved</span>' : '<span class="pill missing">none</span>'}</label>
+         <input id="n-gpass" value="" placeholder="${n.hasGmailPass ? 'saved — type to replace' : 'abcd efgh ijkl mnop'}" spellcheck="false" />
+         <p class="dim">Not your Google password — make one at myaccount.google.com → Security → App passwords. It only works if 2-step verification is on.</p>
+         <label>Carrier</label>
+         <select id="n-carrier">
+           <option value="">try every carrier (first test)</option>
+           ${['verizon', 'att', 'tmobile', 'googlefi', 'sprint', 'uscellular', 'cricket', 'boost', 'mint', 'visible']
+    .map((c) => `<option value="${c}"${n.carrier === c ? ' selected' : ''}>${c}</option>`).join('')}
+         </select>
+         <p class="dim">This sends mail to your carrier's SMS gateway, so it arrives as a normal text. Nothing on the Mac is involved — it works with the lid shut.</p>`
+      : n.kind === 'messages'
+        ? `<label>Phone number</label><input id="n-to" value="${esc(n.to ?? '')}" placeholder="+18045551234" inputmode="tel" />
+           <p class="dim">Sends through the Messages app, which needs the Mac's screen awake — it cannot work with the lid shut.</p>`
       : n.kind === 'webhook'
         ? `<label>Webhook URL</label><input id="n-url" value="${esc(n.url ?? '')}" placeholder="https://ntfy.sh/your-topic" spellcheck="false" inputmode="url" />`
         : `<label>Command (<span class="mono">{{message}}</span> is substituted)</label>
@@ -1281,13 +1295,35 @@ async function paintNotify() {
     ...($('n-url') ? { url: $('n-url').value.trim() } : {}),
     ...($('n-cmd') ? { command: $('n-cmd').value.trim() } : {}),
   });
-  $('n-save').onclick = async () => { await patch(fields()); showBanner('notification settings saved'); };
+
+  // The Gmail credential belongs with the other secrets, not in notify.json,
+  // so it is saved through the email settings instead.
+  const saveGmail = async () => {
+    if (!$('n-guser')) return;
+    const body = { gmailUser: $('n-guser').value.trim(), carrier: $('n-carrier').value };
+    // An empty box means "leave it alone", never "erase the password".
+    const pass = $('n-gpass').value.trim();
+    if (pass) body.gmailPass = pass;
+    await api('/api/email', { method: 'POST', body: JSON.stringify(body) });
+  };
+  $('n-save').onclick = async () => { await saveGmail(); await patch(fields()); showBanner('notification settings saved'); };
   $('n-test').onclick = async () => {
-    $('n-test').textContent = 'sending…';
-    await api('/api/notify', { method: 'POST', body: JSON.stringify(fields()) });
-    const r = await api('/api/notify/test', { method: 'POST', body: JSON.stringify({}) });
-    showBanner(r.ok ? `sent (${r.via})` : `failed: ${r.reason}`);
-    paintNotify();
+    const btn = $('n-test');
+    btn.textContent = 'sending…';
+    btn.disabled = true;
+    try {
+      await saveGmail();
+      await api('/api/notify', { method: 'POST', body: JSON.stringify(fields()) });
+      const r = await api('/api/notify/test', { method: 'POST', body: JSON.stringify({}) });
+      showBanner(r.ok ? `sent (${r.via})` : `failed: ${r.reason}`, !r.ok);
+    } catch (e) {
+      // A thrown request used to leave the button reading "sending…" for good,
+      // which is indistinguishable from the thing still being in flight.
+      showBanner(`test failed: ${e.message}`, true);
+    } finally {
+      btn.disabled = false;
+      paintNotify();
+    }
   };
 }
 
@@ -1452,7 +1488,7 @@ function modelSheet(alias) {
         patch: { model: $('m-model').value.trim(), baseUrl: $('m-base').value.trim() },
       }),
     });
-    settingsSheet();
+    modelsSheet();
   };
 }
 
@@ -1712,78 +1748,217 @@ let usageWindow = 'seven_day';
  * showing only the tailnet link leaves you unable to open your own app on the
  * machine running it.
  */
+// Which apps are expanded to show their sessions. Survives re-renders.
+const expandedApps = new Set();
+
+/**
+ * One home for everything: apps at the top level, each expandable to the
+ * sessions working on it. There is no separate sessions list — a session is
+ * reached by opening its app. Sessions not tied to an app are grouped at the end.
+ */
+let lastAppsData = null;   // cached so expand/collapse re-renders without refetching
+
 async function appsSheet() {
   let d;
   try { d = await api('/api/apps'); }
   catch (e) { return openSheet(`<h2>Apps</h2><p class="dim">${esc(e.message)}</p>`); }
-
   await refreshState();
+  lastAppsData = d;
+  renderAppsSheet(d);
+}
+
+/**
+ * Draw the apps-and-sessions sheet from already-fetched data.
+ *
+ * Toggling an app's expander used to call appsSheet(), which re-hit /api/apps —
+ * and that endpoint probes every app over HTTP, reads the Tailscale table and
+ * asks gh for visibility, so a tap felt sluggish. Expansion is a pure view
+ * change, so it re-renders from the cached data instead.
+ */
+function renderAppsSheet(d) {
   const sessionsFor = (id) => state.sessions.filter((x) => x.appId === id);
+  const known = new Set(d.apps.map((a) => a.id));
+  const loose = state.sessions.filter((x) => !x.appId || !known.has(x.appId));
 
-  const rows = d.apps.length ? d.apps.map((a) => {
-    const mine = sessionsFor(a.id);
-    return `<div class="item app-card">
-      <div class="grow">
-        <div class="t">${esc(a.name)}
-          <span class="pill ${a.running ? 'ready' : ''}">${a.running ? 'running' : 'stopped'}</span></div>
-        <div class="s">${esc(shortDir(a.dir))}${a.repo ? ` · ${esc(a.repo)}` : ''}</div>
-        ${a.running ? `<div class="s app-links">
-            <a href="${esc(a.urls.phone ?? '#')}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone ?? 'tailscale down')}</a><br>
-            <a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>
-          </div>` : `<div class="s dim">port ${a.port} · publishes on ${a.servePort}</div>`}
-        <div class="s dim">${mine.length} session${mine.length === 1 ? '' : 's'}${
-  mine.length ? `: ${mine.map((x) => esc(`${x.name} (${x.model})`)).join(', ')}` : ''}</div>
-      </div>
-      <div class="app-actions">
-        <button class="x" data-app-run="${esc(a.id)}">${a.running ? '■' : '▶'}</button>
-        <button class="x" data-app-edit="${esc(a.id)}">✎</button>
-        <button class="x" data-app-log="${esc(a.id)}">▤</button>
-      </div>
+  const sessionRow = (sn) => `
+    <div class="item sub-session${sn.id === state.session?.id ? ' on' : ''}" data-open="${esc(sn.id)}">
+      <div class="grow"><div class="t">${esc(sn.name)} ${sessionStatus(sn)}</div>
+        <div class="s">${esc(sn.model)} · ${sn.turns} turns</div></div>
+      <button class="x" data-fork="${esc(sn.id)}" title="Fork onto another model">⑂</button>
+      <button class="x" data-rename="${esc(sn.id)}" title="Rename">✎</button>
+      <button class="x" data-del="${esc(sn.id)}" title="Delete">×</button>
     </div>`;
-  }).join('') : '<p class="dim">no apps yet — an app is a project you can launch and open</p>';
 
-  openSheet(`<h2>Apps</h2>${rows}
-    <div class="actions"><button class="primary" id="app-new">new app</button></div>`);
+  const appCard = (a) => {
+    const mine = sessionsFor(a.id);
+    const open = expandedApps.has(a.id);
+    const label = !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
+    const links = [];
+    if (a.urls.phone) links.push(`<a href="${esc(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
+    if (a.urls.desktop) links.push(`<a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
+    return `<div class="app-block${open ? ' open' : ''}">
+      <div class="item app-card" data-app-toggle="${esc(a.id)}">
+        <span class="app-caret">${open ? '▾' : '▸'}</span>
+        <div class="grow">
+          <div class="t">${esc(a.name)}
+            <span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span></div>
+          <div class="s">${esc(shortDir(a.dir))}${a.start ? '' : ' · no start command'}</div>
+          ${a.running && a.reachable && links.length
+    ? `<div class="s app-links">${links.join('<br>')}</div>` : ''}
+          <div class="s dim">${mine.length} session${mine.length === 1 ? '' : 's'}</div>
+        </div>
+        <div class="app-actions">
+          <button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : a.start ? 'Start' : 'No start command yet — tap to add one'}">${a.running ? '■' : '▶'}</button>
+          <button class="x" data-app-edit="${esc(a.id)}" title="Edit app">✎</button>
+        </div>
+      </div>
+      ${open ? `<div class="app-sessions">
+        ${mine.length ? mine.map(sessionRow).join('') : '<p class="dim sub-empty">no sessions yet</p>'}
+        <button class="ghost sub-new" data-new-in="${esc(a.id)}">+ new session in ${esc(a.name)}</button>
+      </div>` : ''}
+    </div>`;
+  };
 
+  const appsHtml = d.apps.length ? d.apps.map(appCard).join('') : '<p class="dim">no apps yet — an app is a project you can launch, open and work on</p>';
+  const looseHtml = loose.length
+    ? `<h3>Not in an app</h3>${loose.map(sessionRow).join('')}`
+    : '';
+
+  openSheet(`<h2>Apps &amp; sessions</h2>${appsHtml}${looseHtml}
+    <div class="actions">
+      <button class="primary" id="app-new">new app</button>
+      <button class="ghost" id="sess-new">new session</button>
+    </div>`);
+
+  // --- app-level actions ---
   $('app-new').onclick = () => appEditSheet(null);
-  $('sheet').querySelectorAll('[data-app-edit]').forEach((el) => {
-    el.onclick = () => appEditSheet(d.apps.find((a) => a.id === el.dataset.appEdit));
-  });
-  $('sheet').querySelectorAll('[data-app-log]').forEach((el) => {
-    el.onclick = async () => {
-      const text = await (await fetch(`/api/apps/${el.dataset.appLog}/log`)).text();
-      openSheet(`<h2>Log</h2><pre class="log">${esc(text.slice(-8000) || '(empty)')}</pre>
-        <div class="actions"><button class="ghost" id="back">back</button></div>`);
-      $('back').onclick = appsSheet;
+  $('sess-new').onclick = () => { draft = {}; newSheet(); };
+  $('sheet').querySelectorAll('[data-app-toggle]').forEach((el) => {
+    el.onclick = (e) => {
+      if (e.target.closest('.app-actions') || e.target.closest('a')) return;  // buttons/links are their own
+      const id = el.dataset.appToggle;
+      if (expandedApps.has(id)) expandedApps.delete(id); else expandedApps.add(id);
+      renderAppsSheet(d);   // instant: no refetch, just redraw
     };
   });
+  $('sheet').querySelectorAll('[data-app-edit]').forEach((el) => {
+    el.onclick = (e) => { e.stopPropagation(); appEditSheet(d.apps.find((a) => a.id === el.dataset.appEdit)); };
+  });
   $('sheet').querySelectorAll('[data-app-run]').forEach((el) => {
-    el.onclick = async () => {
-      const app = d.apps.find((a) => a.id === el.dataset.appRun);
-      el.disabled = true;
-      el.textContent = '…';
-      try {
-        const r = await api(`/api/apps/${app.id}/${app.running ? 'stop' : 'start'}`, { method: 'POST' });
-        // Fail closed: a stop that cannot be confirmed says so rather than
-        // redrawing as though it worked.
-        if (r.unconfirmed) showBanner(`${app.name} did not confirm it stopped — something is still holding port ${app.port}`, true);
-        else if (r.served === false) showBanner(`${app.name} is up locally, but Tailscale would not publish it`, true);
-      } catch (e) { showBanner(e.message, true); }
+    el.onclick = (e) => { e.stopPropagation(); runApp(d.apps.find((a) => a.id === el.dataset.appRun), el); };
+  });
+  $('sheet').querySelectorAll('[data-new-in]').forEach((el) => {
+    el.onclick = () => { draft = { appId: el.dataset.newIn }; newSheet(); };
+  });
+
+  // --- session-level actions ---
+  $('sheet').querySelectorAll('[data-open]').forEach((el) => {
+    el.onclick = (e) => {
+      if (e.target.dataset.del || e.target.dataset.rename || e.target.dataset.fork) return;
+      openSession(el.dataset.open);
+    };
+  });
+  $('sheet').querySelectorAll('[data-fork]').forEach((el) => {
+    el.onclick = async (e) => { e.stopPropagation(); await openSession(el.dataset.fork); forkSheet(); };
+  });
+  $('sheet').querySelectorAll('[data-rename]').forEach((el) => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const id = el.dataset.rename;
+      const current = state.sessions.find((x) => x.id === id)?.name ?? '';
+      const name = prompt('Rename session', current);
+      if (!name?.trim() || name === current) return;
+      await api(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) });
+      if (state.session?.id === id) {
+        const fresh = await api(`/api/sessions/${id}`);
+        tabs.chat.session = fresh; state.session = fresh; paintHeader();
+      }
+      appsSheet();
+    };
+  });
+  $('sheet').querySelectorAll('[data-del]').forEach((el) => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const id = el.dataset.del;
+      if (!confirm('Delete this session?')) return;
+      await api(`/api/sessions/${id}`, { method: 'DELETE' });
+      if (state.session?.id === id) { state.session = null; drawTranscript(); paintHeader(); }
       appsSheet();
     };
   });
 }
 
-/** Create or edit an app. The directory is the app's, and sessions inherit it. */
+/** Start or stop an app, with clear feedback. Shared by the app card. */
+async function runApp(app, el) {
+  if (!app.running && !app.start?.trim()) {
+    showBanner(`${app.name} has no start command yet — add one here, then tap ▶`, true);
+    appEditSheet(app);
+    return;
+  }
+  if (el) { el.disabled = true; el.textContent = '…'; }
+  showBanner(app.running ? `stopping ${app.name}…` : `starting ${app.name}…`);
+  try {
+    const r = await api(`/api/apps/${app.id}/${app.running ? 'stop' : 'start'}`, { method: 'POST' });
+    if (r.unconfirmed) showBanner(`${app.name} did not confirm it stopped — something is still holding its port`, true);
+    else if (r.launchdRemoved?.length) showBanner(`${app.name} stopped — also unregistered its background service so it stays down`);
+    else if (app.running) showBanner(`${app.name} stopped`);
+    else {
+      const fresh = (await api('/api/apps')).apps.find((x) => x.id === app.id);
+      if (fresh?.reachable) showBanner(`${app.name} is running — laptop ${fresh.urls.desktop}${fresh.urls.phone ? ` · phone ${fresh.urls.phone}` : ''}`);
+      else showBanner(`${app.name} was launched but is not answering yet — check its log (✎ → view log) if it doesn't come up`, true);
+    }
+  } catch (e) { showBanner(e.message, true); }
+  appsSheet();
+}
+
 /**
- * Create or edit an app.
+ * GitHub visibility for one app, inside its edit sheet.
  *
- * `app` is the saved record, or null when creating; `draft` carries values
- * across a trip through the folder browser. Those are kept apart deliberately:
- * the browser used to hand back a plain object with no id, which made the save
- * think it was editing and PATCH `/api/apps/undefined` — so opening the browser
- * at all, even to cancel, broke creating an app with "no such app".
+ * Read on open so it reflects the true state on GitHub, not a guess. Making a
+ * repo public is hard to undo, so that direction takes a second, deliberate
+ * tap rather than a single one.
  */
+async function paintAppVisibility(app) {
+  const box = $('ap-vis');
+  if (!box) return;
+  let v;
+  try { v = await api(`/api/apps/${app.id}/git`); }
+  catch (e) { box.innerHTML = `<p class="dim">${esc(e.message)}</p>`; return; }
+  if (!v.ok) {
+    box.innerHTML = `<p class="dim">${esc(v.reason || 'visibility unavailable')} — is <span class="mono">gh</span> signed in?</p>`;
+    return;
+  }
+  const isPublic = v.visibility === 'public';
+  box.innerHTML = `
+    <div class="row">
+      <button class="ghost${isPublic ? '' : ' on'}" data-setvis="private">🔒 private</button>
+      <button class="ghost${isPublic ? ' on' : ''}" data-setvis="public">🌐 public</button>
+    </div>
+    <p class="dim">${isPublic
+      ? 'Anyone can see this repository.'
+      : 'Only you can see this repository.'} <a href="${esc(v.url)}" target="_blank" rel="noopener">${esc(v.repo)}</a></p>`;
+
+  box.querySelectorAll('[data-setvis]').forEach((el) => {
+    el.onclick = async () => {
+      const want = el.dataset.setvis;
+      if (want === v.visibility) return;
+      // Public is the irreversible-feeling direction; confirm it explicitly.
+      if (want === 'public' && el.dataset.armed !== '1') {
+        el.dataset.armed = '1';
+        el.textContent = '🌐 tap again to make public';
+        setTimeout(() => { el.dataset.armed = ''; el.textContent = '🌐 public'; }, 3000);
+        return;
+      }
+      box.innerHTML = '<p class="dim">changing…</p>';
+      try {
+        const r = await api(`/api/apps/${app.id}/visibility`, { method: 'POST', body: JSON.stringify({ visibility: want }) });
+        showBanner(r.ok ? `${app.name} is now ${want} on GitHub` : `couldn't change: ${r.reason}`, !r.ok);
+      } catch (e) { showBanner(e.message, true); }
+      paintAppVisibility(app);
+    };
+  });
+}
+
 function appEditSheet(app = null, draft = null) {
   const existing = Boolean(app?.id);
   const a = draft ?? app ?? { name: '', dir: '', start: '', repo: '' };
@@ -1798,10 +1973,12 @@ function appEditSheet(app = null, draft = null) {
     <p class="dim">Runs in the app's folder with <span class="mono">PORT</span> set${existing ? ` to ${app.port}` : ' to the port this app is given'}.</p>
     <label>Repository (optional)</label>
     <input id="ap-repo" value="${esc(a.repo ?? '')}" spellcheck="false" placeholder="git@github.com:you/app.git" />
+    ${existing && a.repo ? `<label>GitHub visibility</label>
+      <div id="ap-vis"><p class="dim">checking…</p></div>` : ''}
     <div class="actions">
       <button class="primary" id="ap-save">${existing ? 'save' : 'create app'}</button>
       <button class="ghost" id="ap-back">back</button>
-      ${existing ? '<button class="ghost" id="ap-del">delete</button>' : ''}
+      ${existing ? '<button class="ghost" id="ap-log">view log</button><button class="ghost" id="ap-del">delete</button>' : ''}
     </div>`);
 
   const values = () => ({
@@ -1828,13 +2005,15 @@ function appEditSheet(app = null, draft = null) {
   }
 
   $('ap-back').onclick = appsSheet;
-  if ($('ap-del')) {
-    $('ap-del').onclick = async () => {
-      // Sessions are not deleted with the app; they just come unattached.
-      await api(`/api/apps/${app.id}`, { method: 'DELETE' });
-      appsSheet();
-    };
-  }
+  if ($('ap-vis')) paintAppVisibility(app);
+
+  if ($('ap-log')) $('ap-log').onclick = async () => {
+    const text = await (await fetch(`/api/apps/${app.id}/log`)).text();
+    openSheet(`<h2>Log — ${esc(app.name)}</h2><pre class="log">${esc(text.slice(-8000) || '(empty)')}</pre>`
+      + `<div class="actions"><button class="ghost" id="lb">back</button></div>`);
+    $('lb').onclick = () => appEditSheet(app);
+  };
+  if ($('ap-del')) $('ap-del').onclick = () => appDeleteSheet(app);
   $('ap-save').onclick = async () => {
     const v = values();
     const body = { name: v.name.trim(), start: v.start.trim(), repo: v.repo.trim() || null };
@@ -1844,6 +2023,79 @@ function appEditSheet(app = null, draft = null) {
       else await api('/api/apps', { method: 'POST', body: JSON.stringify({ ...body, dir: v.dir.trim() }) });
       appsSheet();
     } catch (e) { showBanner(e.message, true); }
+  };
+}
+
+
+/**
+ * Deleting an app, with the consequences spelled out.
+ *
+ * Removing the record is cheap and reversible — recreate the app and point it
+ * at the same folder. Deleting the folder is neither, so it is off by default,
+ * named in full, and needs a second tap that says what it is about to erase.
+ */
+async function appDeleteSheet(app) {
+  let mine = [];
+  try {
+    await refreshState();
+    mine = state.sessions.filter((x) => x.appId === app.id);
+  } catch { /* the counts are a courtesy, not a gate */ }
+
+  openSheet(`<h2>Delete ${esc(app.name)}</h2>
+    <p class="dim">Stopping it, retiring its Tailscale address and discarding its log happens either way.</p>
+    <label>Also delete</label>
+    <div class="item">
+      <label class="grow"><input type="checkbox" id="del-files" />
+        the folder <span class="mono">${esc(shortDir(app.dir))}</span> and everything in it</label>
+    </div>
+    <div class="item">
+      <label class="grow"><input type="checkbox" id="del-sessions" ${mine.length ? '' : 'disabled'} />
+        ${mine.length ? `its ${mine.length} session${mine.length === 1 ? '' : 's'} and their transcripts` : 'no sessions are attached'}</label>
+    </div>
+    <p class="dim" id="del-warn"></p>
+    <div class="actions">
+      <button class="ghost" id="del-cancel">cancel</button>
+      <button class="primary danger" id="del-go">delete app</button>
+    </div>`);
+
+  const warn = () => {
+    const f = $('del-files').checked;
+    const s2 = $('del-sessions').checked;
+    $('del-warn').textContent = f || s2
+      ? `This cannot be undone. ${[f ? shortDir(app.dir) : null, s2 ? `${mine.length} transcript${mine.length === 1 ? '' : 's'}` : null].filter(Boolean).join(' and ')} will be erased.`
+      : 'The folder stays on disk; only the harness forgets the app.';
+    $('del-go').textContent = f || s2 ? 'delete permanently' : 'remove from harness';
+  };
+  $('del-files').onchange = warn;
+  $('del-sessions').onchange = warn;
+  warn();
+
+  $('del-cancel').onclick = () => appEditSheet(app);
+  $('del-go').onclick = async () => {
+    const f = $('del-files').checked;
+    const s2 = $('del-sessions').checked;
+    // A second tap for the irreversible half, because this is a phone and the
+    // first one is easy to hit by accident.
+    if ((f || s2) && $('del-go').dataset.armed !== '1') {
+      $('del-go').dataset.armed = '1';
+      $('del-go').textContent = 'tap again to erase';
+      return;
+    }
+    $('del-go').disabled = true;
+    try {
+      const r = await api(`/api/apps/${app.id}?files=${f ? 1 : 0}&sessions=${s2 ? 1 : 0}`, { method: 'DELETE' });
+      // Report what actually happened rather than assuming it all worked.
+      const bits = [];
+      if (r.stopped === false) bits.push('it would not confirm it stopped');
+      if (r.dirError) bits.push(`the folder was kept: ${r.dirError}`);
+      if (f && r.dir) bits.push('folder deleted');
+      if (r.removedSessions?.length) bits.push(`${r.removedSessions.length} session(s) deleted`);
+      if (bits.length) showBanner(`${r.name}: ${bits.join(' · ')}`, Boolean(r.dirError || r.stopped === false));
+      appsSheet();
+    } catch (e) {
+      showBanner(e.message, true);
+      $('del-go').disabled = false;
+    }
   };
 }
 
@@ -1961,11 +2213,13 @@ async function filesSheet(start) {
     ${d.note ? `<p class="dim warn-text">${esc(d.note)}</p>` : ''}
     ${rows || '<p class="dim">empty folder</p>'}
     <div class="actions">
+      <button class="ghost" id="f-back">‹ settings</button>
       ${state.session ? '<button class="ghost" id="f-proj">project folder</button>' : ''}
       <button class="primary" id="f-close">done</button>
     </div>`);
 
   $('f-close').onclick = closeSheet;
+  $('f-back').onclick = settingsSheet;
   if ($('f-proj')) $('f-proj').onclick = () => filesSheet(state.session.projectDir);
   $('sheet').querySelectorAll('[data-dir]').forEach((el) => {
     el.onclick = () => filesSheet(el.dataset.dir);
@@ -2005,63 +2259,10 @@ async function viewFile(file, kind) {
   $('v-close').onclick = closeSheet;
 }
 
-$('files').onclick = () => filesSheet();
 
 // --------------------------------------------------------- laptop's screen
 
-let screenTimer = null;
-
-function screenSheet() {
-  const stamp = () => `/api/screen?ts=${Date.now()}`;
-  openSheet(`<h2>Laptop screen</h2>
-    <img id="scr" alt="the laptop's screen"
-         style="width:100%;border:1px solid var(--line);border-radius:10px;background:var(--bg-3)" />
-    <p class="dim" id="scr-note">tap the image to refresh</p>
-    <div class="actions">
-      <button class="ghost" id="scr-auto">auto-refresh</button>
-      <button class="primary" id="scr-close">done</button>
-    </div>`);
-
-  const refresh = async () => {
-    // Ask first, so a 503 can explain itself instead of showing a broken image.
-    try {
-      const res = await fetch(stamp());
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        $('scr').removeAttribute('src');
-        $('scr-note').textContent = body.detail ?? body.error ?? `capture failed (${res.status})`;
-        return;
-      }
-      const blob = await res.blob();
-      $('scr').src = URL.createObjectURL(blob);
-      $('scr-note').textContent = 'tap the image to refresh';
-    } catch (e) {
-      $('scr-note').textContent = e.message;
-    }
-  };
-  $('scr').onclick = refresh;
-  refresh();
-
-  $('scr-auto').onclick = () => {
-    if (screenTimer) {
-      clearInterval(screenTimer);
-      screenTimer = null;
-      $('scr-auto').textContent = 'auto-refresh';
-    } else {
-      screenTimer = setInterval(refresh, 2000);
-      $('scr-auto').textContent = 'stop auto-refresh';
-    }
-  };
-  $('scr-close').onclick = () => {
-    clearInterval(screenTimer);
-    screenTimer = null;
-    closeSheet();
-  };
-}
-
-$('screen').onclick = screenSheet;
 $('menu').onclick = sessionsSheet;
-$('appsbtn').onclick = appsSheet;
 $('gear').onclick = settingsSheet;
 function paintPending() {
   const box = $('pending');
@@ -2116,8 +2317,6 @@ $('stop').onclick = () => api(`/api/sessions/${cur().session.id}/stop`, { method
 
 $('sheet-back').onclick = (e) => {
   if (e.target.id !== 'sheet-back') return;
-  clearInterval(screenTimer);
-  screenTimer = null;
   clearInterval(jobsTimer);
   jobsTimer = null;
   closeSheet();

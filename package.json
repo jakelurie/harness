@@ -25,7 +25,6 @@
     "files": [
       "electron/**/*",
       "src/**/*",
-      "renderer/**/*",
       "package.json"
     ],
     "mac": {

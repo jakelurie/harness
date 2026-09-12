@@ -33,7 +33,7 @@ import * as codexCli from '../src/core/providers/codex-cli.js';
 import { refuseAsProjectDir } from '../src/core/harness-guard.js';
 import { loadEmailConfig, saveEmailConfig } from '../src/core/email-config.js';
 import * as apps from '../src/core/apps.js';
-import { createBeacons, wedgeMessage, DEFAULT_STALL_MS } from '../src/core/beacon.js';
+import { createBeacons, wedgeMessage, stallMsFor } from '../src/core/beacon.js';
 import { sendEmail } from '../src/core/email.js';
 import * as usageStore from '../src/core/usage-store.js';
 import {
@@ -165,6 +165,27 @@ function authorized(req, url) {
 function describeArg(call) {
   const a = call?.args ?? {};
   return String(a.command ?? a.path ?? '').slice(0, 60);
+}
+
+/**
+ * The notifier's settings, complete.
+ *
+ * Which channel to use lives in notify.json; the Gmail credential that the SMS
+ * channel needs lives in the 0600 secrets file with the other keys. Merging
+ * them here means no caller has to know that, and the password is read at the
+ * moment of sending rather than held anywhere.
+ */
+async function notifyConfig(extra = {}) {
+  const base = await loadNotify(USER_DATA);
+  if ({ ...base, ...extra }.kind !== 'sms') return { ...base, ...extra };
+  const email = await loadEmailConfig(USER_DATA).catch(() => ({}));
+  return {
+    ...base,
+    gmailUser: email.gmailUser ?? null,
+    gmailPass: email.gmailPass ?? null,
+    carrier: email.carrier ?? null,
+    ...extra,
+  };
 }
 
 function broadcast(sessionId, payload) {
@@ -479,6 +500,9 @@ const server = http.createServer(async (req, res) => {
       const [, appId, verb] = appMatch;
 
       if (req.method === 'GET' && !appId) {
+        // Visibility is not shown in the list (it lives in each app's edit
+        // sheet, fetched on demand), so the list does not pay for a gh call
+        // per app — that was making the sheet slow to open.
         return json(res, 200, { apps: await apps.listWithStatus(USER_DATA) });
       }
       if (req.method === 'POST' && !appId) {
@@ -491,15 +515,35 @@ const server = http.createServer(async (req, res) => {
         catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (req.method === 'DELETE' && appId) {
-        // Sessions outlive the app record; they simply become unattached
-        // rather than being deleted along with it.
-        const sessions = await store.list();
-        for (const meta of sessions) {
-          if (meta.appId !== appId) continue;
-          const sn = await store.load(meta.id, { repair: false }).catch(() => null);
-          if (sn) { sn.appId = null; await store.save(sn); }
+        // Two separate decisions, both the user's: whether the folder goes,
+        // and whether the sessions go. Neither is implied by the other.
+        const wantFiles = url.searchParams.get('files') === '1';
+        const wantSessions = url.searchParams.get('sessions') === '1';
+
+        const attached = (await store.list()).filter((m) => m.appId === appId);
+        const removedSessions = [];
+        for (const meta of attached) {
+          if (wantSessions) {
+            running.get(meta.id)?.controller.abort();
+            live.delete(meta.id);
+            await store.remove(meta.id);
+            // A monitor companion is part of its session, not a session of
+            // its own, so it goes with it.
+            await store.remove(`${meta.id}--monitor`).catch(() => {});
+            removedSessions.push(meta.name);
+          } else {
+            // Sessions outlive the app record; they simply come unattached.
+            const sn = await store.load(meta.id, { repair: false }).catch(() => null);
+            if (sn) { sn.appId = null; await store.save(sn); }
+          }
         }
-        return json(res, 200, { apps: await apps.remove(USER_DATA, appId) });
+
+        try {
+          const done = await apps.destroy(USER_DATA, appId, { files: wantFiles });
+          return json(res, 200, { ...done, removedSessions, apps: await apps.load(USER_DATA) });
+        } catch (e) {
+          return json(res, 400, { error: e.message });
+        }
       }
       if (req.method === 'POST' && appId && verb === 'start') {
         try {
@@ -510,6 +554,17 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && appId && verb === 'stop') {
         try { return json(res, 200, await apps.stop(USER_DATA, appId)); }
         catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'GET' && appId && verb === 'git') {
+        const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
+        if (!app) return json(res, 404, { error: 'no such app' });
+        return json(res, 200, await git.visibility(app.dir));
+      }
+      if (req.method === 'POST' && appId && verb === 'visibility') {
+        const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
+        if (!app) return json(res, 404, { error: 'no such app' });
+        const { visibility } = await readBody(req);
+        return json(res, 200, await git.setVisibility(app.dir, visibility));
       }
       if (req.method === 'GET' && appId && verb === 'log') {
         const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
@@ -545,7 +600,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/api/notify') {
-      return json(res, 200, await loadNotify(USER_DATA));
+      {
+        const n = await loadNotify(USER_DATA);
+        const e = await loadEmailConfig(USER_DATA).catch(() => ({}));
+        // The password itself never leaves the machine; only whether one exists.
+        return json(res, 200, {
+          ...n, gmailUser: e.gmailUser ?? null, carrier: e.carrier ?? null, hasGmailPass: Boolean(e.gmailPass),
+        });
+      }
     }
     if (req.method === 'POST' && pathname === '/api/notify') {
       const body = await readBody(req);
@@ -553,7 +615,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, cfg);
     }
     if (req.method === 'POST' && pathname === '/api/notify/test') {
-      const cfg = { ...(await loadNotify(USER_DATA)), ...(await readBody(req)), enabled: true };
+      const cfg = await notifyConfig({ ...(await readBody(req)), enabled: true });
       return json(res, 200, await sendNotify(cfg, 'Harness test — notifications are working.'));
     }
 
@@ -562,7 +624,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.searchParams.get('session');
       const session = id ? (live.get(id) ?? (await store.load(id, { repair: false }).catch(() => null))) : null;
       if (!session) return json(res, 404, { error: 'no such session' });
-      return json(res, 200, { ...(await git.status(session.projectDir)), enabled: Boolean(session.gitPush) });
+      return json(res, 200, { ...(await git.status(session.projectDir)), enabled: session.gitPush !== false });
     }
 
     if (req.method === 'POST' && pathname === '/api/git/connect') {
@@ -801,36 +863,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- a look at the laptop's screen, for when a tool opens a window
-    if (req.method === 'GET' && pathname === '/api/screen') {
-      // With the lid shut and no external display, macOS powers the only
-      // framebuffer down: screencapture succeeds but returns pure black. Say
-      // so rather than handing back a black rectangle that reads as a bug.
-      const asleep = await new Promise((resolve) => {
-        execFile('system_profiler', ['SPDisplaysDataType'], { timeout: 8000 }, (err, out) =>
-          resolve(!err && /Display Asleep:\s*Yes/i.test(out)));
-      });
-      if (asleep) {
-        return json(res, 503, {
-          error: 'display asleep',
-          detail: 'The laptop screen is off (lid closed, no external display), so there is nothing to capture.',
-        });
-      }
-
-      const shot = path.join(os.tmpdir(), `harness-screen-${process.pid}.jpg`);
-      await new Promise((resolve, reject) => {
-        // -x silences the shutter; -t jpg keeps it small enough to poll.
-        execFile('screencapture', ['-x', '-t', 'jpg', shot], (err) => (err ? reject(err) : resolve()));
-      });
-      const body = await fs.readFile(shot);
-      await fs.rm(shot, { force: true });
-      res.writeHead(200, {
-        'Content-Type': 'image/jpeg',
-        'Content-Length': body.length,
-        'Cache-Control': 'no-store',
-      });
-      return res.end(body);
-    }
-
     if (req.method === 'POST' && pathname === '/api/dirs') {
       const { parent, name } = await readBody(req);
       if (!name || /[/\\]/.test(name)) return json(res, 400, { error: 'invalid folder name' });
@@ -1004,7 +1036,9 @@ const server = http.createServer(async (req, res) => {
         const controller = new AbortController();
         const turn = { controller, startedAt: Date.now(), last: null };
         running.set(id, turn);
-        beacons.start(id, { model: session.model });
+        // The threshold depends on the backend: an agent CLI legitimately
+        // goes quiet for many minutes while running its own loop.
+        beacons.start(id, { model: session.model, stallMs: stallMsFor(cfg.models[session.model]) });
         json(res, 200, { ok: true }); // answer now; the work streams over SSE
 
         runTurn({
@@ -1045,12 +1079,20 @@ const server = http.createServer(async (req, res) => {
             // Commit whatever the turn changed on disk. Failures are reported
             // into the transcript rather than thrown: a git problem should not
             // look like the turn itself failed.
-            if (session.gitPush) {
+            // On by default: only an explicit false turns it off, so sessions
+            // created before this became the default still push.
+            if (session.gitPush !== false) {
               try {
                 const last = [...session.events].reverse().find((e) => e.type === 'assistant');
+                // Auto-create a repo only for a session that belongs to an app —
+                // that is what "every project pushes and is private" means. A
+                // loose or scratch session (no app, e.g. a test run) commits
+                // locally or pushes to an existing remote, but never conjures a
+                // brand-new GitHub repo out of a temp folder.
                 const res = await git.commitAndPush(session.projectDir, {
                   model: session.model,
                   servedModel: last?.servedModel,
+                  autoCreatePrivate: Boolean(session.appId),
                 });
                 if (res.skipped === 'no changes') {
                   // Nothing to say: a turn that changed no files is normal.
@@ -1095,7 +1137,7 @@ const server = http.createServer(async (req, res) => {
             // awaited by anything that matters: a notifier is not allowed to
             // delay or break a turn.
             (async () => {
-              const cfg = await loadNotify(USER_DATA);
+              const cfg = await notifyConfig();
               const seconds = (Date.now() - turn.startedAt) / 1000;
               if (!cfg.enabled || seconds < (cfg.minSeconds ?? 0)) return;
 
@@ -1154,14 +1196,16 @@ setInterval(() => collectUsage().catch(() => {}), 60_000).unref();
  * they are not at the laptop watching.
  */
 async function checkForStalls() {
-  const stallMs = Number(process.env.HARNESS_STALL_MS ?? DEFAULT_STALL_MS);
-  const due = beacons.due({ stallMs });
+  // Each beacon carries its own threshold; an override applies to all of them.
+  const override = process.env.HARNESS_STALL_MS ? Number(process.env.HARNESS_STALL_MS) : undefined;
+  const due = beacons.due(override ? { stallMs: override } : {});
   for (const stall of due) {
     const session = live.get(stall.sessionId);
     const text = wedgeMessage({
       sessionName: session?.name ?? stall.sessionId,
       model: stall.model,
       silentMs: stall.silentMs,
+      runningMs: stall.runningMs,
       lastActivity: stall.lastActivity,
     });
 
@@ -1174,7 +1218,7 @@ async function checkForStalls() {
       await store.save(session).catch(() => {});
     }
 
-    const cfg = await loadNotify(USER_DATA).catch(() => null);
+    const cfg = await notifyConfig().catch(() => null);
     if (cfg?.enabled) await sendNotify(cfg, text).catch(() => {});
     const email = await loadEmailConfig(USER_DATA).catch(() => null);
     if (email?.apiKey && email?.to) {

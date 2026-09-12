@@ -108,6 +108,7 @@ body {
 .empty { text-align: center; margin-top: 22vh; color: var(--fg-faint); }
 .empty p { margin: 4px 0; }
 .dim { font-family: var(--mono); font-size: 13px; }
+.mono { font-family: var(--mono); }
 
 .turn { margin-bottom: 14px; }
 .who {
@@ -189,7 +190,7 @@ body {
   border: 1px solid var(--line); border-radius: 12px;
   padding: 11px 12px;
   font: 16px/1.4 inherit;   /* 16px or iOS zooms the page on focus */
-  resize: none; max-height: 40vh; outline: none;
+  resize: none; min-height: 46px; max-height: 40vh; outline: none;
 }
 #input:focus { border-color: var(--fg-faint); }
 
@@ -258,6 +259,7 @@ body {
   border-radius: 999px; border: 1px solid var(--line); color: var(--fg-faint); }
 .pill.ready { color: var(--green); border-color: rgba(139, 212, 156, 0.4); }
 .pill.missing { color: var(--yellow); border-color: rgba(224, 175, 104, 0.4); }
+.pill.warm { color: var(--yellow); border-color: rgba(224, 175, 104, 0.4); }
 
 /* ------------------------------------------------------------- working bar */
 
@@ -706,3 +708,67 @@ pre.log {
   background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px; overflow-x: auto; font-size: 11px; max-height: 60vh;
 }
+
+/* The irreversible action should not look like the safe one. */
+button.primary.danger { background: #f7768e; color: #14161a; }
+button.primary.danger:active { background: #db5f78; }
+.item label.grow { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.item input[type="checkbox"] { margin-top: 2px; flex: 0 0 auto; width: 18px; height: 18px; }
+
+/* What a session is doing, at a glance in the session browser. */
+.sstat {
+  font-family: var(--mono); font-size: 10px; font-weight: 400;
+  padding: 2px 7px; border-radius: 999px; margin-left: 6px;
+  white-space: nowrap; vertical-align: middle;
+}
+.sstat.waiting  { color: var(--fg-faint); border: 1px solid var(--line); }
+.sstat.thinking { color: #9ece6a; border: 1px solid #2d4a2b; background: #1b2a1a; }
+.sstat.quiet    { color: #e0af68; border: 1px solid #4a3b1f; background: #2a2216; }
+.sstat .pulse {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: #9ece6a; margin-right: 5px; vertical-align: middle;
+  animation: sstat-pulse 1.4s ease-in-out infinite;
+}
+@keyframes sstat-pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+/* Explanatory prose in a sheet reads as prose. Monospace stays for identifiers
+   (the .s lines, .mono spans), not for sentences. */
+#sheet p.dim { font-family: inherit; font-size: 13px; color: var(--fg-dim); line-height: 1.45; margin: 6px 0 10px; }
+#sheet p.dim .mono { font-family: var(--mono); }
+
+/* Harness-wide settings as a row list; each row opens its own sheet. */
+.rowlinks { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg-3); }
+.rowlink {
+  display: flex; justify-content: space-between; align-items: center;
+  width: 100%; min-height: 48px; padding: 0 14px;
+  background: none; border: none; border-bottom: 1px solid var(--line);
+  color: var(--fg); font-size: 14.5px; text-align: left;
+}
+.rowlink:last-child { border-bottom: none; }
+.rowlink:active { background: var(--line); }
+.rowlink .chev { color: var(--fg-faint); font-size: 20px; line-height: 1; }
+
+/* Rarely-touched session options, folded until wanted. */
+details.more { margin-top: 14px; }
+details.more summary { font-size: 13px; color: var(--fg-dim); cursor: pointer; padding: 8px 0; list-style: none; }
+details.more summary::-webkit-details-marker { display: none; }
+details.more summary::before { content: '▸ '; }
+details.more[open] summary::before { content: '▾ '; }
+
+
+/* Apps & sessions, one list. An app expands to the sessions inside it. */
+.app-block { margin-bottom: 10px; }
+.app-card { cursor: pointer; align-items: flex-start; }
+.app-caret { flex: 0 0 auto; color: var(--fg-faint); font-size: 13px; width: 16px; padding-top: 2px; }
+.app-sessions {
+  margin: 2px 0 0 16px; padding-left: 10px;
+  border-left: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.item.sub-session { background: var(--bg-2); }
+.sub-empty { padding: 4px 2px; }
+.sub-new { align-self: flex-start; font-size: 12.5px; padding: 6px 10px; }
+/* Rows with a status chip: let the name wrap if long so the chip is never
+   clipped (only these rows; other .t cards keep their ellipsis truncation). */
+.app-card .t, .sub-session .t { white-space: normal; overflow: visible; }
+.app-card .t .sstat, .sub-session .t .sstat { flex: 0 0 auto; }

@@ -64,6 +64,28 @@ const st = await status(repo);
 check('status reports branch, remote and last commit',
   st.branch === 'main' && st.remote === remote && Boolean(st.lastCommit), JSON.stringify(st));
 
+// ---- push-every-turn defaults: auto-init and auto-create-private behavior
+// A brand-new project with no repo: without auto-create it is skipped, exactly
+// as before.
+const fresh1 = await fs.mkdtemp(path.join(os.tmpdir(), 'fresh1-'));
+await fs.writeFile(path.join(fresh1, 'a.txt'), 'hi');
+const skipped = await commitAndPush(fresh1, {});
+check('a non-repo is skipped when auto-create is off', skipped.skipped === 'not a git repository', JSON.stringify(skipped));
+
+// With auto-create on, the same folder becomes a repo and the change is
+// committed. A fake remote is pre-set so the test never contacts GitHub; that
+// exercises init + commit without creating a real repo.
+const fresh2 = await fs.mkdtemp(path.join(os.tmpdir(), 'fresh2-'));
+await fs.writeFile(path.join(fresh2, 'a.txt'), 'hi');
+git(['init', '-b', 'main'], fresh2);
+git(['remote', 'add', 'origin', 'file:///nonexistent/repo.git'], fresh2);
+const auto = await commitAndPush(fresh2, { model: 'opus', autoCreatePrivate: true });
+check('auto-create commits the change', auto.committed === true && auto.files.includes('a.txt'), JSON.stringify(auto.files));
+check('a real commit is recorded', git(['log', '--oneline'], fresh2).length > 0);
+check('a failed push is reported, not thrown', auto.ok === true && auto.pushed === false);
+
+for (const d of [fresh1, fresh2]) await fs.rm(d, { recursive: true, force: true });
+
 for (const d of [plain, remote, repo]) await fs.rm(d, { recursive: true, force: true });
 console.log(`\n${fail.length ? `${fail.length} FAILED` : 'all green'}`);
 process.exit(fail.length ? 1 : 0);
