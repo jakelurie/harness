@@ -23,6 +23,7 @@ import { runTurn } from '../src/core/agent.js';
 import { loadConfig, patchModel } from '../src/core/config.js';
 import { resetClients } from '../src/core/providers/index.js';
 import { setSecret } from '../src/core/secrets.js';
+import { transcribe, transcriptionKey } from '../src/core/transcription.js';
 import * as attachments from '../src/core/attachments.js';
 import * as git from '../src/core/git.js';
 import { loadNotify, saveNotify, send as sendNotify, summarise } from '../src/core/notify.js';
@@ -323,8 +324,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
       return serveStatic(res, 'index.html');
     }
-    if (req.method === 'GET' && /^\/(app\.js|styles\.css)$/.test(pathname)) {
+    if (req.method === 'GET' && /^\/(app\.js|voice\.js|styles\.css)$/.test(pathname)) {
       return serveStatic(res, pathname.slice(1));
+    }
+
+    // Voice uses the same access control as the rest of the chat.
+    if (req.method === 'GET' && pathname === '/api/transcription') {
+      return json(res, 200, { configured: Boolean(await transcriptionKey(USER_DATA)) });
+    }
+    if (req.method === 'POST' && pathname === '/api/transcription') {
+      try {
+        return json(res, 200, await transcribe(req, await transcriptionKey(USER_DATA)));
+      } catch (e) {
+        return json(res, e.status || 500, { error: e.status ? e.message : 'Transcription failed. Please retry.' });
+      }
     }
 
     // ---- state

@@ -193,6 +193,10 @@ body {
   resize: none; min-height: 46px; max-height: 40vh; outline: none;
 }
 #input:focus { border-color: var(--fg-faint); }
+#dictate { flex: 0 0 44px; min-height: 46px; padding: 0 6px; }
+#dictate.recording { background: var(--red); color: #12151a; }
+#voice-status { padding: 8px 12px; background: var(--bg-2); font-size: 14px; }
+#voice-status button { min-height: 44px; margin-left: 8px; }
 
 .primary, .danger {
   flex: 0 0 auto; min-height: 44px; padding: 0 18px;

@@ -84,6 +84,13 @@ check('accepts the token in the query string', (await fetch(`${root}/api/state?t
 // ---- static + state ----
 const html = await (await call('/')).text();
 check('serves the phone UI', html.includes('<title>Harness</title>') && html.includes('app.js'));
+check('serves the voice recorder', (await call('/voice.js')).status === 200 && html.includes('id="dictate"'));
+check('voice status requires authentication', (await fetch(`${root}/api/transcription`)).status === 401);
+await call('/api/models/key', { method: 'POST', body: JSON.stringify({ alias: '__transcription', apiKey: 'sk-voice-test' }) });
+const voiceStatus = await (await call('/api/transcription')).json();
+check('voice status exposes readiness only', JSON.stringify(voiceStatus) === '{"configured":true}');
+check('voice rejects unsupported formats', (await call('/api/transcription', { method: 'POST', body: '{}' })).status === 415);
+check('voice rejects empty recordings', (await call('/api/transcription', { method: 'POST', headers: { 'Content-Type': 'audio/mp4' }, body: '' })).status === 400);
 
 const state = await (await call('/api/state')).json();
 check('state lists the model', state.models.mock?.model === 'mock-1');

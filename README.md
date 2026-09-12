@@ -78,6 +78,24 @@ than exposing it publicly.
 
 ## Providers
 
+### Voice dictation from a phone
+
+After updating, restart the harness server and refresh the phone page. Open
+**Settings → Voice setup** and save an OpenAI API key (API billing is separate
+from ChatGPT/Codex subscriptions). The server stores it with the other secrets;
+`OPENAI_API_KEY` is also supported as a fallback.
+
+Open the chat using its HTTPS Tailscale URL, tap **🎙**, allow microphone access,
+and tap **■** when finished. The server sends the recording to OpenAI's
+`gpt-transcribe` model and inserts the transcript into your draft for review.
+Nothing is sent to the chat until you press **send**. Recordings stop after five
+minutes; failed uploads can be retried while the page stays open. Cancel,
+switching sessions or tabs, and leaving the page discard the pending recording.
+Audio is processed in memory and is not saved by the harness.
+
+See [OpenAI transcription documentation](https://developers.openai.com/api/docs/guides/speech-to-text)
+for supported API behavior and [model pricing](https://developers.openai.com/api/docs/models/gpt-transcribe).
+
 | `provider` | for | key |
 | --- | --- | --- |
 | `claude-cli` | Claude via the local CLI | none — it holds your login |
@@ -125,4 +143,3 @@ python-cli/      the original CLI prototype, archived
 ## Licence
 
 MIT.
-

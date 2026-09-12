@@ -545,6 +545,7 @@ function clearLive(tab = state.tab) {
 // ---------------------------------------------------------------- session
 
 async function openSession(id) {
+  window.cancelDictation?.();
   const session = await api(`/api/sessions/${id}`);
   state.session = session;
   tabs.chat.session = session;
@@ -571,6 +572,7 @@ async function ensureMonitorSession() {
 }
 
 async function setTab(name) {
+  window.cancelDictation?.();
   state.tab = name;
   document.querySelectorAll('.tab').forEach((el) => {
     el.classList.toggle('on', el.dataset.tab === name);
@@ -745,6 +747,7 @@ function listen(tab, id) {
 }
 
 async function send() {
+  if (window.dictationBusy?.()) return showBanner('Finish or cancel dictation before sending.');
   const text = $('input').value.trim();
   const shots = pendingShots.filter((a) => !a.uploading && a.path);
   if (!text && !shots.length) return;
@@ -995,6 +998,7 @@ async function settingsSheet() {
   await refreshState();
   const session = cur().session;
   openSheet(`
+    <button class="ghost" onclick="window.voiceSetup()">Voice setup</button>
     ${session ? `<h2>This ${state.tab === 'monitor' ? 'monitoring ' : ''}session</h2>
       <label>Name</label>
       <div class="row"><input id="s-name" value="${esc(session.name ?? '')}" spellcheck="false" />

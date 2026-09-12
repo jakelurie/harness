@@ -138,7 +138,14 @@ export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost 
       parts.push(`\nIf you start long-running work the user should watch, redirect its output to a log file and add an entry to the monitors file at ${monitorsFile} (a JSON array; use {"id","label","kind":"file","path","session":"${scope}"}). Read that file first for the full set of monitor kinds.`);
     }
   }
-  parts.push('\nYou run inside a harness. The harness\'s own files are read-only to you: you may look at them, but any attempt to write there is refused, and that is deliberate rather than a fault to work around.');
+  if (session.editsHarness) {
+    // This is a session of the built-in Harness app: it is meant to edit the
+    // harness itself. Do not tell it the harness is read-only — it is not, for
+    // this session.
+    parts.push('\nYou ARE the harness. This session edits the harness\'s own source code (the project directory is the harness itself), which is exactly your job here — treat requests to change the harness as ordinary work, not something forbidden. Two limits: the harness data directory (secrets, tokens, the session store) is off-limits and writes there are refused; and changes to the running server take effect only after it restarts, so say when a restart is needed rather than assuming a change is already live.');
+  } else {
+    parts.push('\nYou run inside a harness. The harness\'s own files are read-only to you: you may look at them, but any attempt to write there is refused, and that is deliberate rather than a fault to work around.');
+  }
   parts.push('You can email the user with send_email when something needs them and they may not be watching — a long run finished, a decision is needed, or work failed in a way you cannot resolve. Do not email for routine progress.');
   if (session.confineToProjectDir) {
     parts.push('File tools are confined to this directory; paths outside it are refused.');
