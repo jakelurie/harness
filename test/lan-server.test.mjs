@@ -354,6 +354,15 @@ check('a repointed session is no longer flagged',
     /t\.session = updated/.test(clientSrc) && /setSessionModel/.test(clientSrc));
   check('and the settings sheet offers a real switch control',
     /data-switch=/.test(clientSrc));
+  const harnessRows = clientSrc.match(/<div class="rowlinks">([\s\S]*?)<\/div>/)?.[1] ?? '';
+  check('voice setup sits in the shared Harness settings rows',
+    harnessRows.includes('class="rowlink" id="h-voice"') &&
+    clientSrc.includes("$('h-voice').onclick = () => window.voiceSetup();") &&
+    !clientSrc.includes('onclick="window.voiceSetup()"'));
+  const voiceSrc = await fs.readFile(path.join(here, '..', 'server', 'public', 'voice.js'), 'utf8');
+  check('voice setup uses shared actions and settings navigation',
+    voiceSrc.includes('<div class="actions"><button id="voice-save"') &&
+    voiceSrc.includes('${backToSettings}') && voiceSrc.includes("$('sub-back').onclick = settingsSheet;"));
 }
 
 // ---- the monitoring tab's companion session ----

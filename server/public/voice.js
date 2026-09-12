@@ -48,11 +48,12 @@
 
   window.voiceSetup = () => {
     openSheet(`<h2>Voice setup</h2>
-      <p>Record on your phone; OpenAI transcribes the audio. Review the text before sending.</p>
+      <p class="dim">Record on your phone; OpenAI transcribes the audio. Review the text before sending.</p>
       <label>OpenAI API key</label>
       <input id="voice-key" type="password" autocomplete="off" placeholder="Enter API key" />
-      <button id="voice-save" class="primary">Save key</button>
-      <p id="voice-save-status" role="status"></p>`);
+      <div class="actions"><button id="voice-save" class="primary">Save key</button></div>
+      <p id="voice-save-status" role="status"></p>${backToSettings}`);
+    $('sub-back').onclick = settingsSheet;
     $('voice-save').onclick = async () => {
       const apiKey = $('voice-key').value.trim();
       if (!apiKey) return;

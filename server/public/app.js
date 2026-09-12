@@ -998,7 +998,6 @@ async function settingsSheet() {
   await refreshState();
   const session = cur().session;
   openSheet(`
-    <button class="ghost" onclick="window.voiceSetup()">Voice setup</button>
     ${session ? `<h2>This ${state.tab === 'monitor' ? 'monitoring ' : ''}session</h2>
       <label>Name</label>
       <div class="row"><input id="s-name" value="${esc(session.name ?? '')}" spellcheck="false" />
@@ -1048,6 +1047,7 @@ async function settingsSheet() {
     <div class="rowlinks">
       <button class="rowlink" id="h-files"><span>Files</span><span class="chev">›</span></button>
       <button class="rowlink" id="h-models"><span>Models &amp; keys</span><span class="chev">›</span></button>
+      <button class="rowlink" id="h-voice"><span>Voice setup</span><span class="chev">›</span></button>
       <button class="rowlink" id="h-notify"><span>Notifications</span><span class="chev">›</span></button>
       <button class="rowlink" id="h-email"><span>Email</span><span class="chev">›</span></button>
     </div>
@@ -1055,6 +1055,7 @@ async function settingsSheet() {
 
   $('h-files').onclick = () => filesSheet();
   $('h-models').onclick = modelsSheet;
+  $('h-voice').onclick = () => window.voiceSetup();
   $('h-notify').onclick = notifySheet;
   $('h-email').onclick = emailSheet;
 
