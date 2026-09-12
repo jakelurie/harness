@@ -1021,27 +1021,26 @@ async function settingsSheet() {
       <div class="row"><input id="s-dir" value="${esc(session.projectDir)}" spellcheck="false" />
       <button class="ghost" id="s-browse" style="flex:0 0 92px">browse</button></div>
       <div class="actions"><button class="ghost" id="s-dir-save">save folder</button></div>
+      <label>Reference folders (read-only)</label>
+      <textarea id="s-readable" spellcheck="false"
+        placeholder="/Users/you/Projects/otherProject">${esc((session.readableDirs ?? []).join('\n'))}</textarea>
+      <p class="dim">Let the agent’s file tools read reference material outside this project without granting write access. Enter one folder per line; leave empty if unneeded.</p>
+      <div class="actions"><button class="ghost" id="s-readable-save">save folders</button></div>
       <label>Git</label>
       <div id="s-git"><p class="dim">checking…</p></div>
-      <details class="more"><summary>More options</summary>
-        ${(() => {
-          const m = state.models[session.model];
-          if (!m?.softLimitTokens) return '';
-          const on = Boolean(session.allowLongContext);
-          return `<label>Context band</label>
-            <div class="row">
-              <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(m.softLimitTokens)}</button>
-              <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(m.contextTokens)}</button>
-            </div>
-            <p class="dim">${esc(m.label ?? m.alias)} reprices the whole request past
-              ${compact(m.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
-              output to fit; allowing it keeps everything and pays the higher rate.</p>`;
-        })()}
-        <label>Also readable (one folder per line, read-only)</label>
-        <textarea id="s-readable" spellcheck="false"
-          placeholder="/Users/you/Projects/otherProject">${esc((session.readableDirs ?? []).join('\n'))}</textarea>
-        <div class="actions"><button class="ghost" id="s-readable-save">save folders</button></div>
-      </details>` : ''}
+      ${(() => {
+        const m = state.models[session.model];
+        if (!m?.softLimitTokens) return '';
+        const on = Boolean(session.allowLongContext);
+        return `<label>Context band</label>
+          <div class="row">
+            <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(m.softLimitTokens)}</button>
+            <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(m.contextTokens)}</button>
+          </div>
+          <p class="dim">${esc(m.label ?? m.alias)} reprices the whole request past
+            ${compact(m.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
+            output to fit; allowing it keeps everything and pays the higher rate.</p>`;
+      })()}` : ''}
 
     <h3>Harness</h3>
     <div class="rowlinks">

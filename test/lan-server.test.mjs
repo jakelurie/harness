@@ -354,6 +354,11 @@ check('a repointed session is no longer flagged',
     /t\.session = updated/.test(clientSrc) && /setSessionModel/.test(clientSrc));
   check('and the settings sheet offers a real switch control',
     /data-switch=/.test(clientSrc));
+  const settingsSrc = clientSrc.slice(clientSrc.indexOf('async function settingsSheet()'), clientSrc.indexOf('const backToSettings'));
+  check('reference folders stay visible beside project settings',
+    settingsSrc.includes('Reference folders (read-only)') &&
+    settingsSrc.indexOf('id="s-readable"') < settingsSrc.indexOf('<label>Git</label>') &&
+    !settingsSrc.includes('<details') && settingsSrc.includes('id="s-readable-save"'));
   const harnessRows = clientSrc.match(/<div class="rowlinks">([\s\S]*?)<\/div>/)?.[1] ?? '';
   check('voice setup sits in the shared Harness settings rows',
     harnessRows.includes('class="rowlink" id="h-voice"') &&

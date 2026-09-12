@@ -751,14 +751,6 @@ button.primary.danger:active { background: #db5f78; }
 .rowlink:active { background: var(--line); }
 .rowlink .chev { color: var(--fg-faint); font-size: 20px; line-height: 1; }
 
-/* Rarely-touched session options, folded until wanted. */
-details.more { margin-top: 14px; }
-details.more summary { font-size: 13px; color: var(--fg-dim); cursor: pointer; padding: 8px 0; list-style: none; }
-details.more summary::-webkit-details-marker { display: none; }
-details.more summary::before { content: '▸ '; }
-details.more[open] summary::before { content: '▾ '; }
-
-
 /* Apps & sessions, one list. An app expands to the sessions inside it. */
 .app-block { margin-bottom: 10px; }
 .app-card { cursor: pointer; align-items: flex-start; }
