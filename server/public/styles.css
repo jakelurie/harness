@@ -772,3 +772,7 @@ details.more[open] summary::before { content: '▾ '; }
    clipped (only these rows; other .t cards keep their ellipsis truncation). */
 .app-card .t, .sub-session .t { white-space: normal; overflow: visible; }
 .app-card .t .sstat, .sub-session .t .sstat { flex: 0 0 auto; }
+
+/* The built-in Harness app: it edits the harness itself. */
+.app-block.builtin .app-card { border-color: var(--accent); }
+.pill.self { color: var(--accent); border-color: rgba(122,162,247,0.4); }

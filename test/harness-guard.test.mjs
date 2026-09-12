@@ -67,5 +67,30 @@ check('the sandbox profile names both roots',
   sandboxProfile().includes(HARNESS_ROOT) && sandboxProfile().includes(HARNESS_DATA));
 
 await fs.rm(dir, { recursive: true, force: true });
+// ---- the Harness app: a scoped, deliberate exception
+// One built-in app may edit the harness SOURCE, but never its DATA directory.
+import { HARNESS_APP_ID, protectedFromHarnessEditor } from '../src/core/harness-guard.js';
+const src = path.join(HARNESS_ROOT, 'server/index.js');
+const dataFile = path.join(HARNESS_DATA, 'secrets.json');
+
+check('a normal session cannot write the harness source', isProtected(src) === true);
+check('a normal session cannot write the harness data', isProtected(dataFile) === true);
+check('a harness-app session CAN write the harness source', isProtected(src, { allowHarnessSource: true }) === false);
+check('but a harness-app session still cannot write the harness data', isProtected(dataFile, { allowHarnessSource: true }) === true);
+check('rooting the Harness app at the source is allowed', refuseAsProjectDir(HARNESS_ROOT, { allowHarnessSource: true }) === null);
+check('but not at the data directory', Boolean(refuseAsProjectDir(HARNESS_DATA, { allowHarnessSource: true })));
+check('the editor sandbox opens the source', !sandboxProfile({ allowHarnessSource: true }).includes(HARNESS_ROOT));
+check('the editor sandbox still seals the data', sandboxProfile({ allowHarnessSource: true }).includes(HARNESS_DATA));
+check('data is what stays protected from the editor', protectedFromHarnessEditor().includes(HARNESS_DATA));
+
+// The tool layer honours it: a harness-app write to source succeeds, to data fails.
+const hctx = { projectDir: HARNESS_ROOT, allowOutside: true, allowHarnessSource: true };
+const probe = path.join(HARNESS_ROOT, '__guard_probe.txt');
+const w1 = await runTool({ id: 'a', name: 'write_file', args: { path: probe, content: 'ok' } }, hctx);
+check('harness-app write to source lands', /wrote/.test(String(w1.output)), String(w1.output).slice(0, 40));
+await fs.rm(probe, { force: true });
+const w2 = await runTool({ id: 'b', name: 'write_file', args: { path: path.join(HARNESS_DATA, '__nope.txt'), content: 'x' } }, hctx);
+check('harness-app write to data is refused', /refused/.test(String(w2.output)), String(w2.output).slice(0, 50));
+
 console.log(fail.length ? `\nFAILED: ${fail.join(', ')}` : '\nall green');
 process.exit(fail.length ? 1 : 0);

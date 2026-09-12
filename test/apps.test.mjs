@@ -16,7 +16,7 @@ const check = (label, cond, extra = '') => {
 const data = await fs.mkdtemp(path.join(os.tmpdir(), 'apps-'));
 const proj = await fs.mkdtemp(path.join(os.tmpdir(), 'proj-'));
 
-check('no apps to begin with', (await apps.load(data)).length === 0);
+check('only the built-in Harness app to begin with', (await apps.load(data)).filter((x) => x.id !== '__harness').length === 0);
 
 const a = await apps.create(data, { name: 'Job Applier', dir: proj, start: 'echo hi' });
 check('an app gets an id', Boolean(a.id), a.id);
@@ -29,7 +29,7 @@ check('a second app gets different ports', b.port !== a.port && b.servePort !== 
   `${a.port}/${a.servePort} vs ${b.port}/${b.servePort}`);
 
 // ---- it must survive the process, which is the whole point
-const reloaded = await apps.load(data);
+const reloaded = (await apps.load(data)).filter((x) => x.id !== '__harness');
 check('apps persist to disk', reloaded.length === 2);
 check('with their ports intact', reloaded.find((x) => x.id === a.id).port === a.port);
 
@@ -239,14 +239,14 @@ if (process.platform === 'darwin') {
   const dUp = await fs.mkdtemp(path.join(os.tmpdir(), 'linkup-'));
   await fs.writeFile(path.join(dUp, 'apps.json'),
     JSON.stringify({ apps: [{ id: 'up', name: 'Up', dir: '/tmp/nowhere-up', port: 4398, servePort: 8498, pid: null }] }));
-  const [au] = await apps.listWithStatus(dUp);
+  const au = (await apps.listWithStatus(dUp)).find((x) => x.id === 'up');
   check('an answering app is reachable', au.reachable === true, JSON.stringify({ r: au.reachable, run: au.running }));
   check('and gets a laptop link on its live port', au.urls.desktop === 'http://127.0.0.1:4398', String(au.urls.desktop));
 
   const dHung = await fs.mkdtemp(path.join(os.tmpdir(), 'linkhung-'));
   await fs.writeFile(path.join(dHung, 'apps.json'),
     JSON.stringify({ apps: [{ id: 'h', name: 'Hung', dir: '/tmp/nowhere-hung', port: 4397, servePort: 8497, pid: null }] }));
-  const [ah] = await apps.listWithStatus(dHung);
+  const ah = (await apps.listWithStatus(dHung)).find((x) => x.id === 'h');
   check('a held-but-silent port is not reachable', ah.reachable === false, JSON.stringify({ r: ah.reachable, run: ah.running }));
   check('and offers no link', ah.urls.desktop === null && ah.urls.phone === null);
 
@@ -255,6 +255,20 @@ if (process.platform === 'darwin') {
   await fs.rm(dUp, { recursive: true, force: true });
   await fs.rm(dHung, { recursive: true, force: true });
 }
+
+// ---- the built-in Harness app
+const withBuiltin = await apps.load(data);
+check('the Harness app is always present', withBuiltin.some((a) => a.id === '__harness'));
+check('and is first in the list', withBuiltin[0].id === '__harness');
+check('it is marked builtin and edits the harness', withBuiltin[0].builtin === true && withBuiltin[0].editsHarness === true);
+let delErr = null, updErr = null;
+try { await apps.destroy(data, '__harness'); } catch (e) { delErr = e.message; }
+try { await apps.update(data, '__harness', { name: 'x' }); } catch (e) { updErr = e.message; }
+check('it cannot be deleted', /built in/.test(delErr ?? ''), delErr);
+check('it cannot be edited as a record', /built in/.test(updErr ?? ''), updErr);
+// it is synthesised, never written to apps.json
+const raw = JSON.parse(await fs.readFile(apps.appsPath(data), 'utf8'));
+check('it is never persisted to apps.json', !raw.apps.some((a) => a.id === '__harness'), JSON.stringify(raw.apps.map((a)=>a.id)));
 
 await fs.rm(data, { recursive: true, force: true });
 await fs.rm(proj, { recursive: true, force: true });

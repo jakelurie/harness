@@ -881,18 +881,23 @@ const server = http.createServer(async (req, res) => {
         // An app owns its directory; a session attached to one works there
         // rather than carrying a directory of its own.
         let projectDir = askedDir;
+        let editsHarness = false;
         if (appId) {
           const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
           if (!app) return json(res, 400, { error: 'no such app' });
           projectDir = app.dir;
+          editsHarness = Boolean(app.editsHarness);
         }
-        // A session may not be rooted where it could modify the harness.
-        const refusal = refuseAsProjectDir(projectDir);
+        // A session may not be rooted where it could modify the harness — unless
+        // it is a session of the built-in Harness app, which is allowed the
+        // harness source (never its data directory).
+        const refusal = refuseAsProjectDir(projectDir, { allowHarnessSource: editsHarness });
         if (refusal) return json(res, 400, { error: refusal });
         // Typing a path that does not exist yet is a normal thing to do on a
         // phone; create it now rather than failing on the first tool call.
         if (projectDir) await fs.mkdir(projectDir, { recursive: true });
         const session = store.newSession({ name, model, projectDir, system, mode, appId: appId ?? null });
+        if (editsHarness) session.editsHarness = true;
         await store.save(session);
         return json(res, 200, session);
       }

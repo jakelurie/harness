@@ -1794,23 +1794,33 @@ function renderAppsSheet(d) {
     const open = expandedApps.has(a.id);
     const label = !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
     const links = [];
-    if (a.urls.phone) links.push(`<a href="${esc(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
-    if (a.urls.desktop) links.push(`<a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
-    return `<div class="app-block${open ? ' open' : ''}">
+    if (a.urls?.phone) links.push(`<a href="${esc(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
+    if (a.urls?.desktop) links.push(`<a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
+
+    // The built-in Harness app is special: it *is* the running harness, its
+    // sessions edit the harness itself, and it cannot be started, edited as a
+    // record, or deleted.
+    const meta = a.builtin
+      ? `<div class="s dim">the harness itself — sessions here edit its code</div>`
+      : `<div class="s">${esc(shortDir(a.dir))}${a.start ? '' : ' · no start command'}</div>
+         ${a.running && a.reachable && links.length ? `<div class="s app-links">${links.join('<br>')}</div>` : ''}`;
+    const pill = a.builtin
+      ? '<span class="pill self">self</span>'
+      : `<span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span>`;
+    const actions = a.builtin ? '' : `<div class="app-actions">
+          <button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : a.start ? 'Start' : 'No start command yet — tap to add one'}">${a.running ? '■' : '▶'}</button>
+          <button class="x" data-app-edit="${esc(a.id)}" title="Edit app">✎</button>
+        </div>`;
+
+    return `<div class="app-block${open ? ' open' : ''}${a.builtin ? ' builtin' : ''}">
       <div class="item app-card" data-app-toggle="${esc(a.id)}">
         <span class="app-caret">${open ? '▾' : '▸'}</span>
         <div class="grow">
-          <div class="t">${esc(a.name)}
-            <span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span></div>
-          <div class="s">${esc(shortDir(a.dir))}${a.start ? '' : ' · no start command'}</div>
-          ${a.running && a.reachable && links.length
-    ? `<div class="s app-links">${links.join('<br>')}</div>` : ''}
+          <div class="t">${esc(a.name)} ${pill}</div>
+          ${meta}
           <div class="s dim">${mine.length} session${mine.length === 1 ? '' : 's'}</div>
         </div>
-        <div class="app-actions">
-          <button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : a.start ? 'Start' : 'No start command yet — tap to add one'}">${a.running ? '■' : '▶'}</button>
-          <button class="x" data-app-edit="${esc(a.id)}" title="Edit app">✎</button>
-        </div>
+        ${actions}
       </div>
       ${open ? `<div class="app-sessions">
         ${mine.length ? mine.map(sessionRow).join('') : '<p class="dim sub-empty">no sessions yet</p>'}

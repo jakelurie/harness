@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { refuseAsProjectDir, isProtected, protectedRoots } from './harness-guard.js';
+import { refuseAsProjectDir, isProtected, protectedRoots, HARNESS_ROOT, HARNESS_APP_ID } from './harness-guard.js';
 
 const execAsync = promisify(exec);
 
@@ -34,20 +34,48 @@ export function appsPath(userDataDir) {
   return path.join(userDataDir, 'apps.json');
 }
 
+/**
+ * The permanent, undeletable app that refers to the harness itself.
+ *
+ * Sessions opened against it may edit the harness source (see the guard). It is
+ * always first in the list and cannot be removed. Its git remote is the harness
+ * repo, so changes committed here push to the harness like any other project.
+ */
+function harnessApp() {
+  return {
+    id: HARNESS_APP_ID,
+    name: 'Harness',
+    dir: HARNESS_ROOT,
+    repo: 'git@github.com:jakelurie/harness.git',
+    start: '',                 // it is already running — it is the harness
+    editsHarness: true,
+    builtin: true,             // cannot be deleted
+    port: null,
+    servePort: null,
+    createdAt: 0,
+    updatedAt: 0,
+    lastStartedAt: null,
+    pid: null,
+  };
+}
+
 export async function load(userDataDir) {
+  let stored = [];
   try {
     const raw = JSON.parse(await fs.readFile(appsPath(userDataDir), 'utf8'));
-    return Array.isArray(raw.apps) ? raw.apps : [];
-  } catch {
-    return [];
-  }
+    stored = Array.isArray(raw.apps) ? raw.apps : [];
+  } catch { /* none yet */ }
+  // Always present, always first, never persisted as an editable record.
+  return [harnessApp(), ...stored.filter((a) => a.id !== HARNESS_APP_ID)];
 }
 
 async function persist(userDataDir, apps) {
   await fs.mkdir(userDataDir, { recursive: true });
   const file = appsPath(userDataDir);
   const tmp = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify({ apps }, null, 2)}\n`, 'utf8');
+  // The builtin Harness app is synthesised on load, never stored.
+  const toStore = apps.filter((a) => a.id !== HARNESS_APP_ID);
+  await fs.writeFile(tmp, `${JSON.stringify({ apps: toStore }, null, 2)}\n`, 'utf8');
   await fs.rename(tmp, file);
   return apps;
 }
@@ -228,6 +256,7 @@ export async function update(userDataDir, id, patch) {
   const apps = await load(userDataDir);
   const app = apps.find((a) => a.id === id);
   if (!app) throw new Error('no such app');
+  if (app.builtin) throw new Error('the Harness app is built in and cannot be edited');
   if (patch.dir) {
     const refusal = refuseAsProjectDir(patch.dir);
     if (refusal) throw new Error(refusal);
@@ -315,6 +344,7 @@ export async function destroy(userDataDir, id, { files = false } = {}) {
   const apps = await load(userDataDir);
   const app = apps.find((a) => a.id === id);
   if (!app) throw new Error('no such app');
+  if (app.builtin) throw new Error('the Harness app is built in and cannot be deleted');
 
   const done = { name: app.name, stopped: null, unserved: false, log: false, dir: null, dirError: null };
 

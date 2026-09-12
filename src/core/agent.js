@@ -352,6 +352,8 @@ async function runTurnInner({
       const result = await boundedTool(call, {
         projectDir: session.projectDir,
         allowOutside: !session.confineToProjectDir,
+        // The Harness app's sessions may edit the harness source (never its data).
+        allowHarnessSource: Boolean(session.editsHarness),
         readableDirs: session.readableDirs ?? [],
         // So an email says which session sent it: several may be running
         // unattended, and "it finished" is useless without knowing which.

@@ -125,3 +125,5 @@ python-cli/      the original CLI prototype, archived
 ## Licence
 
 MIT.
+
+<!-- edited from a Harness-app session -->

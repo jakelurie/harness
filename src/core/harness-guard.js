@@ -26,9 +26,24 @@ export const HARNESS_DATA =
   process.env.HARNESS_DATA_DIR ||
   path.join(os.homedir(), 'Library', 'Application Support', 'harness');
 
+/** The fixed id of the one app allowed to edit the harness itself. */
+export const HARNESS_APP_ID = '__harness';
+
 /** Everything a session is forbidden to write to. */
 export function protectedRoots() {
   return [HARNESS_ROOT, HARNESS_DATA];
+}
+
+/**
+ * What stays off-limits even to a harness-editing session.
+ *
+ * A session opened against the Harness app may change the harness *source*, but
+ * never its data directory — the secrets file, the access token, the session
+ * store, and every other project's transcripts live there. Editing the code is
+ * the point; reading or corrupting live secrets and state is not.
+ */
+export function protectedFromHarnessEditor() {
+  return [HARNESS_DATA];
 }
 
 function isInside(root, target) {
@@ -36,10 +51,16 @@ function isInside(root, target) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
-/** Would writing here modify the harness? */
-export function isProtected(target) {
+/**
+ * Would writing here modify something protected?
+ *
+ * With `allowHarnessSource`, the harness's own source tree is permitted (that
+ * is the Harness app's whole purpose) but the data directory stays protected.
+ */
+export function isProtected(target, { allowHarnessSource = false } = {}) {
   const abs = path.resolve(target);
-  return protectedRoots().some((root) => isInside(root, abs));
+  const roots = allowHarnessSource ? protectedFromHarnessEditor() : protectedRoots();
+  return roots.some((root) => isInside(root, abs));
 }
 
 /**
@@ -48,9 +69,16 @@ export function isProtected(target) {
  * The home folder counts: it contains both protected roots, so a session
  * rooted there has the harness inside its own scope.
  */
-export function refuseAsProjectDir(dir) {
+export function refuseAsProjectDir(dir, { allowHarnessSource = false } = {}) {
   if (!dir) return null;
   const abs = path.resolve(dir);
+  // The Harness app is deliberately rooted at the harness source; only its data
+  // directory remains off-limits.
+  if (allowHarnessSource) {
+    return protectedFromHarnessEditor().some((r) => isInside(r, abs) || isInside(abs, r))
+      ? `${abs} is inside the harness data directory, which stays protected even for the Harness app.`
+      : null;
+  }
   if (isProtected(abs)) {
     return `${abs} is inside the harness itself. A session cannot be rooted where it could modify the harness that runs it — pick a project folder outside ${HARNESS_ROOT}.`;
   }
@@ -71,7 +99,8 @@ export function refuseAsProjectDir(dir) {
  * Everything else stays permitted, so a session keeps full use of the shell
  * inside its own project.
  */
-export function sandboxProfile(roots = protectedRoots()) {
+export function sandboxProfile({ allowHarnessSource = false } = {}) {
+  const roots = allowHarnessSource ? protectedFromHarnessEditor() : protectedRoots();
   const subpaths = roots.map((r) => `(subpath ${JSON.stringify(r)})`).join(' ');
   return `(version 1)(allow default)(deny file-write* ${subpaths})`;
 }

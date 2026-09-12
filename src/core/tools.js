@@ -66,15 +66,19 @@ function truncate(text) {
  *
  * @param write  true for tools that modify. Read-only grants do not cover these.
  */
-function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false) {
+function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false, allowHarnessSource = false) {
   const target = path.resolve(projectDir, p ?? '.');
 
   // Absolute, and checked before `allowOutside`: no session setting may grant
-  // write access to the harness itself. Reading it stays allowed.
-  if (write && isProtected(target)) {
+  // write access to the harness itself. Reading it stays allowed. The Harness
+  // app's own sessions are the deliberate exception — they may write the
+  // harness source, but never its data directory.
+  if (write && isProtected(target, { allowHarnessSource })) {
     throw new Error(
-      `refused: ${p} is inside the harness itself (${HARNESS_ROOT}). Sessions run inside the harness `
-      + 'and cannot modify it. Work in your own project directory.',
+      allowHarnessSource
+        ? `refused: ${p} is inside the harness data directory, which stays protected even for the Harness app.`
+        : `refused: ${p} is inside the harness itself (${HARNESS_ROOT}). Sessions run inside the harness `
+          + 'and cannot modify it. Work in your own project directory.',
     );
   }
 
@@ -106,9 +110,9 @@ function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false
  * losing the shell entirely would be a worse failure than the one being
  * guarded against, and the file tools enforce the same rule independently.
  */
-function guarded(command) {
+function guarded(command, { allowHarnessSource = false } = {}) {
   if (!existsSync('/usr/bin/sandbox-exec')) return command;
-  return `/usr/bin/sandbox-exec -p ${shellQuote(sandboxProfile())} /bin/sh -c ${shellQuote(command)}`;
+  return `/usr/bin/sandbox-exec -p ${shellQuote(sandboxProfile({ allowHarnessSource }))} /bin/sh -c ${shellQuote(command)}`;
 }
 
 const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -128,7 +132,7 @@ export const TOOLS = [
       required: [],
     },
     async run({ path: p = '.' }, ctx) {
-      const dir = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs);
+      const dir = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, false, ctx.allowHarnessSource);
       const entries = await fs.readdir(dir, { withFileTypes: true });
       if (!entries.length) return '(empty directory)';
       return entries
@@ -148,7 +152,7 @@ export const TOOLS = [
       required: ['path'],
     },
     async run({ path: p }, ctx) {
-      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs);
+      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, false, ctx.allowHarnessSource);
       return await fs.readFile(file, 'utf8');
     },
   },
@@ -165,7 +169,7 @@ export const TOOLS = [
       required: ['path', 'content'],
     },
     async run({ path: p, content }, ctx) {
-      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, true);
+      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, true, ctx.allowHarnessSource);
       await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.writeFile(file, content ?? '', 'utf8');
       const lines = String(content ?? '').split('\n').length;
@@ -186,7 +190,7 @@ export const TOOLS = [
       required: ['path', 'old_string', 'new_string'],
     },
     async run({ path: p, old_string: oldStr, new_string: newStr }, ctx) {
-      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, true);
+      const file = resolveIn(ctx.projectDir, p, ctx.allowOutside, ctx.readableDirs, true, ctx.allowHarnessSource);
       const before = await fs.readFile(file, 'utf8');
       const hits = before.split(oldStr).length - 1;
       if (hits === 0) throw new Error('old_string not found in the file');
@@ -209,7 +213,7 @@ export const TOOLS = [
     async run({ command }, ctx) {
       const PATH = await loginPath();
       try {
-        const { stdout, stderr } = await execAsync(guarded(command), {
+        const { stdout, stderr } = await execAsync(guarded(command, { allowHarnessSource: ctx.allowHarnessSource }), {
           cwd: ctx.projectDir,
           timeout: BASH_TIMEOUT_MS,
           maxBuffer: 8 * 1024 * 1024,
