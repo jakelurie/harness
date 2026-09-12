@@ -100,7 +100,16 @@ export function refuseAsProjectDir(dir, { allowHarnessSource = false } = {}) {
  * inside its own project.
  */
 export function sandboxProfile({ allowHarnessSource = false } = {}) {
-  const roots = allowHarnessSource ? protectedFromHarnessEditor() : protectedRoots();
-  const subpaths = roots.map((r) => `(subpath ${JSON.stringify(r)})`).join(' ');
-  return `(version 1)(allow default)(deny file-write* ${subpaths})`;
+  // Writes: the harness source is writable only for a harness-editor session;
+  // the data directory never is.
+  const writeRoots = allowHarnessSource ? protectedFromHarnessEditor() : protectedRoots();
+  // Reads: the data directory (secrets, the access token, the session store,
+  // every other project's transcripts) is off-limits to any session's shell —
+  // `cat`-ing the secrets file was possible before this. The source stays
+  // readable; only the data directory is sealed.
+  const readRoots = protectedFromHarnessEditor();
+  const deny = (op, roots) => (roots.length
+    ? `(deny ${op} ${roots.map((r) => `(subpath ${JSON.stringify(r)})`).join(' ')})`
+    : '');
+  return `(version 1)(allow default)${deny('file-write*', writeRoots)}${deny('file-read*', readRoots)}`;
 }

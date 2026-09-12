@@ -92,5 +92,15 @@ await fs.rm(probe, { force: true });
 const w2 = await runTool({ id: 'b', name: 'write_file', args: { path: path.join(HARNESS_DATA, '__nope.txt'), content: 'x' } }, hctx);
 check('harness-app write to data is refused', /refused/.test(String(w2.output)), String(w2.output).slice(0, 50));
 
+// No session's shell may READ the data directory (secrets, token, other
+// projects' transcripts) — cat-ing the secrets file was possible before.
+const secretsProbe = path.join(HARNESS_DATA, 'secrets.json');
+const rNormal = await runTool({ id: 'r1', name: 'bash', args: { command: `cat ${JSON.stringify(secretsProbe)}` } }, { projectDir: os.tmpdir(), allowOutside: true });
+check('a normal shell cannot read the harness data dir', /not permitted|no such|denied/i.test(String(rNormal.output)), String(rNormal.output).slice(0, 50));
+const rEditor = await runTool({ id: 'r2', name: 'bash', args: { command: `cat ${JSON.stringify(secretsProbe)}` } }, hctx);
+check('a harness-editor shell cannot read the data dir either', /not permitted|no such|denied/i.test(String(rEditor.output)), String(rEditor.output).slice(0, 50));
+const rSrc = await runTool({ id: 'r3', name: 'bash', args: { command: `head -1 ${JSON.stringify(path.join(HARNESS_ROOT, 'package.json'))}` } }, hctx);
+check('but the harness-editor shell still reads source', /"name"|\{/.test(String(rSrc.output)), String(rSrc.output).slice(0, 30));
+
 console.log(fail.length ? `\nFAILED: ${fail.join(', ')}` : '\nall green');
 process.exit(fail.length ? 1 : 0);

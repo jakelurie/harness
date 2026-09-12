@@ -126,4 +126,3 @@ python-cli/      the original CLI prototype, archived
 
 MIT.
 
-<!-- edited from a Harness-app session -->
