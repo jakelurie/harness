@@ -76,14 +76,13 @@ export async function commitAndPush(dir, { model, servedModel, push = true, auto
   const add = await run(['add', '-A'], st.root);
   if (!add.ok) return { ok: false, error: add.err || 'git add failed' };
 
-  // Nothing about the prompt goes in here - only what changed, and by which model.
+  // Nothing about the prompt or the model goes in here — only what changed. The
+  // commits are the user's own; they carry no AI-authorship bookkeeping.
   const subject = `harness: ${files.length} file${files.length === 1 ? '' : 's'} changed`;
   const body = files.slice(0, 40).map((f) => `- ${f}`).join('\n')
     + (files.length > 40 ? `\n…and ${files.length - 40} more` : '');
-  const trailer = [model ? `Model: ${model}` : '', servedModel && servedModel !== model ? `Served: ${servedModel}` : '']
-    .filter(Boolean).join('\n');
 
-  const message = `${subject}\n\n${body}${trailer ? `\n\n${trailer}` : ''}`;
+  const message = `${subject}\n\n${body}`;
   const commit = await run(['commit', '-m', message], st.root);
   if (!commit.ok) {
     return { ok: false, error: commit.err || commit.out || 'git commit failed', files };
